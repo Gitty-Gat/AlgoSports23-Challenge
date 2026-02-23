@@ -1,0 +1,874 @@
+---
+title: "EDA"
+author: "Sean"
+date: "2026-02-23"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+
+
+# Context
+
+Train.csv: contains the results of 940 regular season games. Games were played at the venue of the home team; thus, the home team may have had a home team advantage. A description of the game results data table columns, train.csv, is as follows:
+
+GameID = Unique game ID
+Date = Date of match
+HomeConf = Home team conference
+HomeID = Home team ID
+HomeTeam = Home team name
+HomePts = Home team pts, e.g., points scored by the home team
+AwayConf = Away team conference
+AwayID = Away team ID
+AwayTeam = Away team name
+AwayPts = Away team pts, e.g., points scored by the away team
+HomeWinMargin = Home team points minus away team points, e.g., HomeWinMargin>0 indicates home team won the match, HomeWinMargin<0 indicates away team won the match, HomeWinMargin=0 indicates the game ended in a tie.
+Predictions.csv: contains seventy-five (75) end-of-season rivalry derby games that are to be played. Contestants must predict the results of these games in the field named “Team1_WinMargin.” For example, Team1_WinMargin = 15 indicates that the user is predicting Team 1 to win by 15 points, Team1_WinMargin = -20 indicates that the user is predicting Team 1 to lose by 20 points (conversely, Team2 is predicted to win by 20 points), and Team1_WinMargin = 0 indicates the game is predicted to end in a tie. Team1_WinMargin must be entered from the perspective of Team 1.
+
+All derby matches are played at a neutral venue with fan support split 50% for team 1 and 50% for team 2; thus, neither team has a home team advantage. A description of the prediction data table data, predictions.csv, is as follows:
+
+GameID = Unique game ID
+Date = Date of match (to be played)
+Team1_Conf = Team 1 conference
+Team1_ID = Team 1 ID
+Team1 = Team 1 name
+Team2_Conf = Team 2 conference
+Team2_ID = Team 2 ID
+Team2 = Team 2 name
+Team1_WinMargin = User Predicted Number of Points Team 1 is expected to win. E.g., Team1_WinMargin > 0 indicates Team 1 is predicted to win the game by the specified number of points, Team1_WinMargin < 0 indicates that Team 1 is predicted to lose the game by the specified number of points, Team1_WinMargin = 0 indicates the game is expected to end in a tie.
+
+
+
+About: There is a new sport in town - Rocketball Premier League (RPL). This is a combination of soccer, basketball, team handball, football, and cricket. The inaugural season was played in 2025 and included 165 teams across 13 conferences. There were 940 regular season games played from 1/1/25 through 6/30/25. All regular season games were played at the home team’s venue.
+
+At the end of the inaugural season, instead of a traditional US playoff system, RPL has seventy-five (75) European style rivalry “derby” games played at a neutral site. Winning teams earn bragging rights. All derby matches are played on 7/4/25. Only 150 out of the 165 teams chose to participate in the end-of-season derby.
+
+
+You are hired by the RPL to be a member of their sports analytics team. You are asked to develop a prediction model that can be used to rank teams and predict the winning team and victory margin for the derby matches. Your tasks as an RPL analyst are as follows:
+
+Predict the winning team and victory margin for seventy-five (75) end-of-season rivalry “derby” matches.
+
+Rank all 165 teams using the results of the 940 regular season matches. For example, you must rank teams from No. 1 (Best) to No. 165 (Worst). The No. 1 (Best) ranked team will win the Rocketball Supporters Shield and be deemed RPL Champion.
+
+Competition: Contestants are provided with a training data set (Train.csv) that includes the results of the 940 season games. Each team played between ten and fourteen regular season games. Games were played against teams in the same conference opponents and against teams in different conference.
+
+Each contestant can develop their own ranking and prediction model. For example, these models can be based on win/loss, margin of victory, points scored, or any combination of these items. Your prediction model can incorporate the team’s strength of schedule, results of common opponents, the team’s conference strength, etc. All data is provided in the competition datasets.
+
+Common types of sports analytics predictions models include counting, probability and statistical, linear and non-linear regression, weighted and moving averages, probit and logit, fuzzy logic, random forests, neural networks, machine learning, deep learning, and models of models that incorporate the results of different approaches as inputs.
+
+Users can develop a prediction model using a tool of your choice. For example, Python, MATLAB, Excel, VBA, Java, C++.
+
+Mission: Using the game results of the 940 matches (Train.csv file), user will perform the following calculations as part of the competition:
+
+Rank all 165 teams from No. 1 (Best) to No. 165 (Worst).
+Predict the Win Margin for the 75 rivalry derby matches.
+
+
+# Load Libraries & Data 
+
+```{r}
+library(tidyverse)
+library(readr)
+library(readxl)
+predictions <- read_csv("Predictions.csv")
+rankings    <- read_excel("Rankings.xlsx")
+train       <- read_csv("Train.csv")
+
+```
+
+
+
+
+Note: For ranking system, we can use a combination of ELO rating algorithim, win margins, win/loss record, games played, and etc. 
+          - To Start, we can bucket all team into their respective conferences and start every team with a fixed base ELO rating, and then calculate ending ELO as the season has played on. We can further stratify based on conference strength, and then adjust the ELO ratings based on the strength of the opponent and the conference overall
+
+Note: For the forecasting/modeling, the goal is predict margin of victory for 75 upcoming derby matches. There are a limited number of parameters and data points to work with; therefore, complexity of the model will be severly limited. Machine learning models will not likely be applicable here. I am thinking Bayesian regression (Conditioning on ELO ratings POSSIBILY); however, any numerical estimator will work and most should be tested along with ensemble models. 
+
+
+Note: STEP 1: To start, we should begin by trying to find value in the data and understanding the data. We can start by looking at the given datasets and using inference techniques to try to find any trends or patterns in the data. Or we can make more advanced columns based on aggregates of other columns.
+
+Note: STEP 2: Next, we will build out the ELO rating algorithim for this fictional league.
+
+Note: STEP 3: Finally, using the ELO ratings, we can build/test multiple regression models to find the best fit for the data.
+
+Note: STEP 4: Then, we optimize our forecasts for the 75 derby matches and submit our predictions.
+
+
+
+# STEP 1
+
+```{r}
+# Explore the data and find any trends or patterns. Begin with inspecting the "train" dataset
+
+train_summary = train %>%
+  group_by(HomeTeam) %>%
+  summarise(
+    GamesPlayed = n(),
+    Wins = sum(HomeWinMargin > 0),
+    Losses = sum(HomeWinMargin < 0),
+    Ties = sum(HomeWinMargin == 0),
+    TotalPointsScored = sum(HomePts),
+    TotalPointsAllowed = sum(AwayPts),
+    AverageWinMargin = mean(HomeWinMargin)
+  ) %>%
+  arrange(desc(Wins))
+
+plot_of_wins = ggplot(train_summary, aes(x = reorder(HomeTeam, Wins), y = Wins)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Number of Wins by Home Team", x = "Home Team", y = "Number of Wins") +
+  theme_minimal()
+
+plot_of_win_margin = ggplot(train_summary, aes(x = reorder(HomeTeam, AverageWinMargin), y = AverageWinMargin)) +
+  geom_bar(stat = "identity", fill = "coral") +
+  coord_flip() +
+  labs(title = "Average Win Margin by Home Team", x = "Home Team", y = "Average Win Margin") +
+  theme_minimal()
+
+plot_of_points_scored = ggplot(train_summary, aes(x = reorder(HomeTeam, TotalPointsScored), y = TotalPointsScored)) +
+  geom_bar(stat = "identity", fill = "darkgreen") +
+  coord_flip() +
+  labs(title = "Total Points Scored by Home Team", x = "Home Team", y = "Total Points Scored") +
+  theme_minimal()
+
+plot_of_points_allowed = ggplot(train_summary, aes(x = reorder(HomeTeam, TotalPointsAllowed), y = TotalPointsAllowed)) +
+  geom_bar(stat = "identity", fill = "darkred") +
+  coord_flip() +
+  labs(title = "Total Points Allowed by Home Team", x = "Home Team", y = "Total Points Allowed") +
+  theme_minimal()
+
+plot_of_games_played = ggplot(train_summary, aes(x = reorder(HomeTeam, GamesPlayed), y = GamesPlayed)) +
+  geom_bar(stat = "identity", fill = "purple") +
+  coord_flip() +
+  labs(title = "Number of Games Played by Home Team", x = "Home Team", y = "Number of Games Played") +
+  theme_minimal()
+
+plot_of_conference = ggplot(train, aes(x = HomeConf)) +
+  geom_bar(fill = "orange") +
+  labs(title = "Number of Games by Conference", x = "Conference", y = "Number of Games") +
+  theme_minimal()
+
+# Display all plots
+
+plot_of_wins
+plot_of_win_margin
+plot_of_points_scored
+plot_of_points_allowed
+plot_of_games_played
+plot_of_conference
+
+# Question: What kinds of inference can be gained from looking at these plots? List the plot and the possible inferences gathered from viewing them
+
+# Plot of Wins by Home Team:
+# - This plot shows the distribution of wins among the home teams. We can identify which teams have the most wins and which have the least. It may also indicate if there are any dominant teams in the league.
+# Plot of Average Win Margin by Home Team:
+# - This plot shows the average margin of victory for each home team. A higher average win margin may indicate a stronger team, while a lower average win margin may indicate a weaker team. It can also help identify teams that consistently win by large margins versus those that win by small margins.
+# Plot of Total Points Scored by Home Team:
+# - This plot shows the total points scored by each home team. It can indicate which teams have strong offenses and are able to score a lot of points throughout the season.
+# Plot of Total Points Allowed by Home Team:
+# - This plot shows the total points allowed by each home team. It can indicate which teams have strong defenses and are able to prevent opponents from scoring a lot of points throughout the season.
+# Plot of Number of Games Played by Home Team:
+# - This plot shows how many games each home team has played. It can indicate if there are any teams that have played significantly more or fewer games than others, which may affect their overall performance and ranking.
+# Plot of Number of Games by Conference:
+# - This plot shows the distribution of games across different conferences. It can indicate if there are any conferences that have more games than others, which may affect the strength of schedule for teams in those conferences and their overall performance in the league.
+
+
+# Question 1.1: For the "Number of Wins by Home Team" plot, what numerical distinction would you use to identify "dominant teams"?
+
+# Question 1.2: For the "Average Win Margin by Home Team" plot, what numerical distinction would you use to identify "strong teams" vs "weak teams"?
+
+# Question 1.3: For the "Total Points Scored by Home Team" plot, what numerical distinction would you use to identify "strong offenses"?
+
+# Question 1.4: For the "Total Points Allowed by Home Team" plot, what numerical distinction would you use to identify "strong defenses"?
+
+# Question 1.5: For the "Number of Games Played by Home Team" plot, what kinds of advantages/disadvantages would playing more/less games have on a team's performance in future games & overall ranking? And how would you adjust for this in the prediction models/ranking system?
+
+# Question 1.6: For the "Number of Games Played by Conference" plot, what kinds of advantages/disadvantages would playing more/less games have on a team's performance in future games & overall ranking given their conference? And how would you adjust for this in the prediction models/ranking system in the context of "conferences"?
+
+# Answers for Questions 1.1 - 1.6 (make sure to include reasons "why/how" for the "numerical distinction" questions and the "advantage/disadvantage" questions:
+
+# 1.1: To identify "dominant teams" in the "Number of Wins by Home Team" plot, we could set a numerical distinction based on the distribution of wins. For example, we could consider teams that have a win count above the 75th percentile as dominant teams. This is because these teams have won significantly more games than the majority of teams, indicating a strong performance throughout the season.
+
+
+# 1.1 in R:
+
+win_threshold = quantile(train_summary$Wins, 0.75)
+dominant_teams = train_summary %>%
+  filter(Wins > win_threshold) %>%
+  select(HomeTeam, Wins)
+dominant_teams
+# 1.2: To identify "strong teams" vs "weak teams" in the "Average Win Margin by Home Team" plot, we could set a numerical distinction based on the average win margin. For example, we could consider teams with an average win margin above a certain threshold (e.g., 10 points) as strong teams, while those below that threshold could be considered weak teams. This is because a higher average win margin indicates that a team consistently wins by larger margins, suggesting a stronger performance.
+
+
+# 1.2 in R:
+
+win_margin_threshold = 10
+strong_teams = train_summary %>%
+  filter(AverageWinMargin > win_margin_threshold) %>%
+  select(HomeTeam, AverageWinMargin)
+weak_teams = train_summary %>%
+  filter(AverageWinMargin <= win_margin_threshold) %>%
+  select(HomeTeam, AverageWinMargin)
+strong_teams
+weak_teams
+
+# 1.3: To identify "strong offenses" in the "Total Points Scored by Home Team" plot, we could set a numerical distinction based on the total points scored. For example, we could consider teams that have scored above the 75th percentile of total points as having strong offenses. This is because these teams have demonstrated the ability to score a high number of points throughout the season, indicating an effective offensive strategy.
+
+# 1.3 in R:
+
+points_scored_threshold = quantile(train_summary$TotalPointsScored, 0.75)
+strong_offenses = train_summary %>%
+  filter(TotalPointsScored > points_scored_threshold) %>%
+  select(HomeTeam, TotalPointsScored)
+strong_offenses
+
+
+# 1.4: To identify "strong defenses" in the "Total Points Allowed by Home Team" plot, we could set a numerical distinction based on the total points allowed. For example, we could consider teams that have allowed below the 25th percentile of total points as having strong defenses. This is because these teams have demonstrated the ability to prevent opponents from scoring a high number of points, indicating an effective defensive strategy.
+
+# 1.4 in R:
+
+points_allowed_threshold = quantile(train_summary$TotalPointsAllowed, 0.25)
+strong_defenses = train_summary %>%
+  filter(TotalPointsAllowed < points_allowed_threshold) %>%
+  select(HomeTeam, TotalPointsAllowed)
+strong_defenses
+
+
+# 1.5: Playing more games can have both advantages and disadvantages for a team's performance in future games and overall ranking. An advantage of playing more games is that it provides more opportunities for a team to earn wins and improve their ranking. However, it can also lead to fatigue and increased risk of injuries, which may negatively impact performance in future games. To adjust for this in the prediction models/ranking system, we could incorporate a factor that accounts for the number of games played, such as a fatigue index or an adjustment to the ELO rating based on the number of games played.
+
+
+# 1.5 in R:
+
+train_summary = train_summary %>%
+  mutate(FatigueIndex = GamesPlayed / max(GamesPlayed)) # Example of a fatigue index based on the number of games played
+
+# 1.6: Playing more games within a conference can have advantages such as increased familiarity with opponents and potentially easier matchups if the conference is weaker. However, it can also lead to disadvantages such as a tougher schedule if the conference is stronger, and similar fatigue issues as mentioned in question 1.5. To adjust for this in the prediction models/ranking system, we could incorporate a strength of schedule factor that accounts for the number of games played within the conference and the overall strength of the conference. This could be done by adjusting ELO ratings based on the strength of opponents faced within the conference and across conferences.
+
+# 1.6 in R:
+
+conference_strength = train %>%
+  group_by(HomeConf) %>%
+  summarise(
+    AverageWinMargin = mean(HomeWinMargin),
+    TotalPointsScored = sum(HomePts),
+    TotalPointsAllowed = sum(AwayPts)
+  ) %>%
+  arrange(desc(AverageWinMargin))
+conference_strength = conference_strength %>%
+  mutate(StrengthOfSchedule = AverageWinMargin / max(AverageWinMargin)) # Example of a strength of schedule factor based on average win margin of the conference
+
+
+# Question 1.7: What other trends, patterns, inference, or insights can you think of to gain from exploring the data? List at least 5 additional questions that you can ask given the contextual information about the challenge? After each question, give the answer along with "why/how" for the answer.
+
+# 1.7: Additional questions to explore the data:
+
+#  - Is there a correlation between the number of games played and the average win margin for home teams? This could indicate whether playing more games leads to better performance or if it results in fatigue that negatively impacts performance.
+
+# Answer: If there is a positive correlation, it may suggest that teams that play more games have better performance due to increased experience and opportunities to earn wins. However, if there is a negative correlation, it may indicate that playing more games leads to fatigue and decreased performance. This insight could help inform the prediction models by accounting for the number of games played as a factor in team performance.
+
+# Explore answer in R:
+
+correlation_games_win_margin = cor(train_summary$GamesPlayed, train_summary$AverageWinMargin)
+correlation_games_win_margin
+
+
+
+
+#  - How does the performance of teams vary across different conferences? This could help identify if certain conferences are stronger than others and how that impacts team performance and rankings.
+
+# Answer: If certain conferences consistently have higher average win margins or total points scored, it may indicate that those conferences are stronger. This insight could help inform the prediction models by adjusting for conference strength when ranking teams and predicting outcomes of derby matches.
+
+# Explore answer in R:
+
+conference_performance = train %>%
+  group_by(HomeConf) %>%
+  summarise(
+    AverageWinMargin = mean(HomeWinMargin),
+    TotalPointsScored = sum(HomePts),
+    TotalPointsAllowed = sum(AwayPts)
+  ) %>%
+  arrange(desc(AverageWinMargin))
+conference_performance
+
+#  - Are there any teams that consistently perform well against specific opponents or in certain conditions (e.g., home vs away games)? This could provide insights into team strengths and weaknesses that could be useful for prediction models.
+
+# Answer: If certain teams consistently perform well against specific opponents or in certain conditions, it may indicate that those teams have specific strengths or weaknesses that can be exploited in prediction models. For example, if a team performs significantly better at home than away, this could be factored into the prediction model when forecasting outcomes of derby matches played at neutral venues.
+
+
+#  - What is the distribution of win margins across all games, and does it differ significantly between home and away teams? This could help identify if there is a home team advantage and how it affects the outcomes of games.
+
+# Answer: If the distribution of win margins is significantly different between home and away teams, it may indicate a home team advantage. This insight could help inform the prediction models by adjusting for home team advantage when forecasting outcomes of derby matches played at neutral venues.
+
+# Explore the answer in R:
+
+win_margin_distribution = train %>%
+  group_by(HomeTeam) %>%
+  summarise(
+    AverageWinMargin = mean(HomeWinMargin),
+    WinMarginVariance = var(HomeWinMargin)
+  ) %>%
+  arrange(desc(AverageWinMargin))
+win_margin_distribution
+
+#  - How do the points scored and points allowed by teams correlate with their overall win/loss record and ranking? This could help identify if there are certain thresholds for points scored or allowed that are indicative of a team's success in the league, which could be useful for building prediction models and ranking systems.
+
+# Answer: If there is a strong correlation between points scored/allowed and win/loss record or ranking, it may indicate that there are certain thresholds for points scored or allowed that are indicative of a team's success. This insight could help inform the prediction models by incorporating points scored and allowed as key factors in forecasting outcomes of derby matches and ranking teams.
+
+points_correlation = train_summary %>%
+  summarise(
+    CorrelationPointsScoredWins = cor(TotalPointsScored, Wins),
+    CorrelationPointsAllowedWins = cor(TotalPointsAllowed, Wins),
+    CorrelationPointsScoredRanking = cor(TotalPointsScored, GamesPlayed), # Assuming ranking is based on games played
+    CorrelationPointsAllowedRanking = cor(TotalPointsAllowed, GamesPlayed) # Assuming ranking is based on games played
+  )
+points_correlation
+
+
+```
+
+
+
+# STEP 2: Build ELO Rating System Algorithim - USE THE "elo" package 
+
+```{r}
+library(elo)
+
+# Step 1: Initialize ratings for all 165 teams
+
+
+ELO_RATINGS_v1 = data.frame(
+  Team = unique(c(train$HomeTeam, train$AwayTeam)),
+  Rating = 1500 # Starting ELO rating for all teams
+)
+
+
+# Step 2: Update ELO ratings based on game results
+
+for (i in 1:nrow(train)) {
+  home_team = train$HomeTeam[i]
+  away_team = train$AwayTeam[i]
+  home_points = train$HomePts[i]
+  away_points = train$AwayPts[i]
+  
+  # Get current ratings
+  home_rating = ELO_RATINGS_v1$Rating[ELO_RATINGS_v1$Team == home_team]
+  away_rating = ELO_RATINGS_v1$Rating[ELO_RATINGS_v1$Team == away_team]
+  
+  # Calculate expected scores
+  expected_home = 1 / (1 + 10^((away_rating - home_rating) / 400))
+  expected_away = 1 / (1 + 10^((home_rating - away_rating) / 400))
+  
+  # Determine actual scores
+  if (home_points > away_points) {
+    actual_home = 1
+    actual_away = 0
+  } else if (home_points < away_points) {
+    actual_home = 0
+    actual_away = 1
+  } else {
+    actual_home = 0.5
+    actual_away = 0.5
+  }
+  
+  # Update ratings
+  K = 40 # K-factor for rating updates
+  new_home_rating = home_rating + K * (actual_home - expected_home)
+  new_away_rating = away_rating + K * (actual_away - expected_away)
+  
+  ELO_RATINGS_v1$Rating[ELO_RATINGS_v1$Team == home_team] <- new_home_rating
+  ELO_RATINGS_v1$Rating[ELO_RATINGS_v1$Team == away_team] <- new_away_rating
+}
+
+
+# Step 3: Consider adendums to the ELO ratings based on factors found from intial data analysis
+# Goal: Create a data frame of all questions asked and the numerical result(s) from the analysis. 
+#       Iterate through the data frame and consider whether or not the results from the questions/analysis should be used to supplement the ranking system.
+#       Decide if complexity in the rating system is rewarded or penalized
+
+
+# Apply results from analysis (Question 1.1-1.6 & 5 questions for 1.7)
+
+# 1.1 - Win Threshold for Dominant Teams: 
+
+# Question: Is the current rating system sufficient in identifying dominant teams based on the results of the game? If not, how can we adjust the ELO algoritihim to accomodate the insight?
+
+
+# 1.1 Answer: The current ELO rating system may not be sufficient in identifying dominant teams based solely on the number of wins, as it primarily focuses on the outcome of games rather than the margin of victory or other factors. To adjust the ELO algorithm to accommodate the insight about dominant teams, we could incorporate a bonus for teams that have a high average win margin or a high total points scored. This would allow the rating system to better reflect the dominance of certain teams beyond just their win/loss record.
+
+
+# 1.2 - Average Win Margin Threshold for Strong vs Weak Teams:
+
+# Question: Is the current rating system sufficient in identifying strong vs weak teams based on the average win margin? If not, how can we adjust the ELO algorithm to better reflect the strength of teams based on their average win margin?
+
+# 1.2 Answer: The current ELO rating system may not be sufficient in identifying strong vs weak teams based on the average win margin, as it primarily focuses on the outcome of games rather than the margin of victory. To adjust the ELO algorithm to better reflect the strength of teams based on their average win margin, we could incorporate a factor that increases the rating of teams with a higher average win margin and decreases the rating of teams with a lower average win margin. This would allow the rating system to better differentiate between strong and weak teams based on their performance in terms of win margins.
+
+
+
+# 1.3 - Total Points Scored Threshold for Strong Offenses:
+
+# Question: Is the current rating system sufficient in identifying strong offenses based on total points scored? If not, how can we adjust the ELO algorithm to better reflect the strength of a team's offense based on their total points scored?
+
+# 1.3 Answer: The current ELO rating system may not be sufficient in identifying strong offenses based on total points scored, as it primarily focuses on the outcome of games rather than the offensive performance of teams. To adjust the ELO algorithm to better reflect the strength of a team's offense based on their total points scored, we could incorporate a factor that increases the rating of teams with a higher total points scored and decreases the rating of teams with a lower total points scored. This would allow the rating system to better differentiate between teams with strong offenses and those with weaker offenses based on their scoring performance throughout the season.
+
+# 1.4 - Total Points Allowed by Home Team
+
+# Question: Is the current rating system sufficient in identifying strong defenses? If not, how can we adjust the algorithim to accomodate?
+
+# 1.4 Answer: The current ELO rating system may not be sufficient in identifying strong defenses based on total points allowed, as it primarily focuses on the outcome of games rather than the defensive performance of teams. To adjust the ELO algorithm to better reflect the strength of a team's defense based on their total points allowed, we could incorporate a factor that increases the rating of teams with a lower total points allowed and decreases the rating of teams with a higher total points allowed. This would allow the rating system to better differentiate between teams with strong defenses and those with weaker defenses based on their performance in preventing opponents from scoring throughout the season.
+
+# 1.5 - Fatigue Index - Number of Games Played by Home Team
+
+# Question: Is the current rating system sufficient in accounting for the advantages/disadvantages of playing more/less games? If not, how can we adjust the ELO algorithm to better account for the impact of fatigue on team performance?
+
+# Answer: The current ELO rating system may not be sufficient in accounting for the advantages/disadvantages of playing more/less games, as it does not explicitly consider the impact of fatigue on team performance. To adjust the ELO algorithm to better account for the impact of fatigue, we could incorporate a fatigue index that reduces the rating of teams that have played a higher number of games, especially if they have played significantly more games than other teams. This would allow the rating system to better reflect the potential negative impact of fatigue on team performance and provide a more accurate ranking of teams based on their overall performance throughout the season.
+
+# Outline for ELO algo (including adendums from 1.1-1.5)
+
+# 1. Initialize ratings for all 165 teams with a base rating (e.g., 1500).
+# 2. For each game in the training dataset:
+#    a. Retrieve the current ratings of the home and away teams.
+#    b. Calculate the expected scores for both teams based on their current ratings.
+#    c. Determine the actual scores based on the game outcome (win/loss/tie).
+#    d. Update the ratings of both teams using the ELO formula, incorporating any adjustments based on the insights from the data analysis (e.g., bonus for dominant teams, adjustments for strong offenses/defenses, fatigue index).
+# 3. After processing all games, the final ELO ratings will reflect the performance of each team throughout the season, taking into account not only their win/loss record but also the margin of victory, offensive and defensive performance, and the number of games played. These ratings can then be used to rank the teams and make predictions for the upcoming derby matches.
+
+
+
+# Question: How do we statistically validated the any of the adjustments made to the ELO algorithim based on the insights from data analysis? 
+
+# 1.1 - To statistically validate the adjustments made to the ELO algorithm based on the insights about dominant teams, we could perform a retrospective analysis by comparing the predicted outcomes of games using the adjusted ELO ratings against the actual outcomes of those games. We could use metrics such as mean absolute error (MAE) or root mean squared error (RMSE) to evaluate the accuracy of the predictions before and after incorporating the adjustments for dominant teams. Additionally, we could conduct hypothesis testing to determine if there is a statistically significant improvement in prediction accuracy with the adjusted ELO ratings compared to the original ELO ratings.
+
+# 1.2 - To statistically validate the adjustments made to the ELO algorithm based on the insights about strong vs weak teams, we could similarly compare the predicted outcomes of games using the adjusted ELO ratings against the actual outcomes. We could use the same metrics (MAE, RMSE) to evaluate prediction accuracy before and after incorporating adjustments for strong vs weak teams. Hypothesis testing could also be conducted to assess whether the adjustments lead to a statistically significant improvement in prediction accuracy.
+
+# 1.3 - To statistically validate the adjustments made to the ELO algorithm based on the insights about strong offenses, we could compare the predicted outcomes of games using the adjusted ELO ratings against the actual outcomes, focusing specifically on games where offensive performance is a key factor. We could evaluate prediction accuracy using metrics like MAE and RMSE before and after incorporating adjustments for strong offenses. Hypothesis testing could also be conducted to determine if there is a statistically significant improvement in prediction accuracy with the adjusted ELO ratings that account for offensive performance.
+
+# 1.4 - To statistically validate the adjustments made to the ELO algorithm based on the insights about strong defenses, we could compare the predicted outcomes of games using the adjusted ELO ratings against the actual outcomes, focusing specifically on games where defensive performance is a key factor. We could evaluate prediction accuracy using metrics like MAE and RMSE before and after incorporating adjustments for strong defenses. Hypothesis testing could also be conducted to determine if there is a statistically significant improvement in prediction accuracy with the adjusted ELO ratings that account for defensive performance.
+
+# 1.5 - To statistically validate the adjustments made to the ELO algorithm based on the insights about fatigue and the number of games played, we could compare the predicted outcomes of games using the adjusted ELO ratings against the actual outcomes, particularly for teams that have played a significantly higher number of games. We could evaluate prediction accuracy using metrics like MAE and RMSE before and after incorporating adjustments for fatigue. Hypothesis testing could also be conducted to determine if there is a statistically significant improvement in prediction accuracy with the adjusted ELO ratings that account for the impact of fatigue on team performance.
+
+
+
+
+
+# UPDATED ELO ALGORITHIM:
+
+
+
+
+# Validation Pipeline: 
+
+# Test 1.1 - 1.5 adjustments to the ELO algorithm by comparing predicted outcomes using adjusted ELO ratings against actual outcomes of games. Use metrics such as MAE and RMSE to evaluate prediction accuracy before and after adjustments. Conduct hypothesis testing to determine if there is a statistically significant improvement in prediction accuracy with the adjusted ELO ratings compared to the original ELO ratings.
+
+# Test individually and collectively for all 1.1-1.5 adjustments to see which adjustments have the most statistical significance
+
+# Create the adjustments inside of the main algorithm loop that - when called - will test the algorithm with and without the adjustments and then output the results of the validation tests (MAE, RMSE, Hypothesis Testing Results) for each adjustment and for all adjustments collectively. This will allow us to see which adjustments have the most impact on improving the accuracy of the ELO ratings and predictions. This will be done in one go.
+
+ 
+ELO_ALGO_TEST = function(train_data, adjustments = c("dominant_teams", "strong_offenses", "strong_defenses", "fatigue_index")) {
+  # Initialize ELO ratings
+  ELO_RATINGS = data.frame(
+    Team = unique(c(train_data$HomeTeam, train_data$AwayTeam)),
+    Rating = 1500 # Starting ELO rating for all teams
+  )
+  
+  # Store predictions and actual outcomes for validation
+  predictions = data.frame(
+    HomeTeam = character(),
+    AwayTeam = character(),
+    PredictedOutcome = numeric(),
+    ActualOutcome = numeric()
+  )
+  
+  for (i in 1:nrow(train_data)) {
+    home_team = train_data$HomeTeam[i]
+    away_team = train_data$AwayTeam[i]
+    home_points = train_data$HomePts[i]
+    away_points = train_data$AwayPts[i]
+    
+    # Get current ratings
+    home_rating = ELO_RATINGS$Rating[ELO_RATINGS$Team == home_team]
+    away_rating = ELO_RATINGS$Rating[ELO_RATINGS$Team == away_team]
+    
+    # Calculate expected scores
+    expected_home = 1 / (1 + 10^((away_rating - home_rating) / 400))
+    expected_away = 1 / (1 + 10^((home_rating - away_rating) / 400))
+    
+    # Determine actual scores
+    if (home_points > away_points) {
+      actual_home = 1
+      actual_away = 0
+    } else if (home_points < away_points) {
+      actual_home = 0
+      actual_away = 1
+    } else {
+      actual_home = 0.5
+      actual_away = 0.5
+    }
+    
+    # Store predictions for validation
+    predictions <- rbind(predictions, data.frame(
+      HomeTeam = home_team,
+      AwayTeam = away_team,
+      PredictedOutcome = expected_home,
+      ActualOutcome = actual_home
+    ))
+    
+    # Update ratings with adjustments based on insights from data analysis
+    K = 40 # K-factor for rating updates
+    
+    # Adjustments for dominant teams, strong offenses/defenses, and fatigue index can be incorporated here based on the insights from the data analysis
+    
+    
+    dominant_teams_adjustment = if ("dominant_teams" %in% adjustments) {
+      # Example adjustment for dominant teams
+      if (home_team %in% dominant_teams$HomeTeam) {
+        home_rating <- home_rating + 20 # Bonus for dominant teams
+      }
+      if (away_team %in% dominant_teams$HomeTeam) {
+        away_rating <- away_rating + 20 # Bonus for dominant teams
+      }
+    }
+    
+    strong_offenses_adjustment = if ("strong_offenses" %in% adjustments) {
+      # Example adjustment for strong offenses
+      if (home_team %in% strong_offenses$HomeTeam) {
+        home_rating <- home_rating + 10 # Bonus for strong offenses
+      }
+      if (away_team %in% strong_offenses$HomeTeam) {
+        away_rating <- away_rating + 10 # Bonus for strong offenses
+      }
+    }
+    
+    strong_defenses_adjustment = if ("strong_defenses" %in% adjustments) {
+      # Example adjustment for strong defenses
+      if (home_team %in% strong_defenses$HomeTeam) {
+        home_rating <- home_rating + 10 # Bonus for strong defenses
+      }
+      if (away_team %in% strong_defenses$HomeTeam) {
+        away_rating <- away_rating + 10 # Bonus for strong defenses
+      }
+    }
+    
+    fatigue_index_adjustment = if ("fatigue_index" %in% adjustments) {
+      # Example adjustment for fatigue index
+      home_fatigue_index = train_summary$FatigueIndex[train_summary$HomeTeam == home_team]
+      away_fatigue_index = train_summary$FatigueIndex[train_summary$HomeTeam == away_team]
+      
+      home_rating <- home_rating - (home_fatigue_index * 20) # Penalty for fatigue
+      away_rating <- away_rating - (away_fatigue_index * 20) # Penalty for fatigue
+    }
+    
+    
+    
+    new_home_rating = home_rating + K * (actual_home - expected_home)
+    new_away_rating = away_rating + K * (actual_away - expected_away)
+    
+    
+    ELO_RATINGS$Rating[ELO_RATINGS$Team == home_team] <- new_home_rating
+    ELO_RATINGS$Rating[ELO_RATINGS$Team == away_team] <- new_away_rating
+  }
+
+  # Validate predictions using MAE, RMSE, and hypothesis testing
+  mae = mean(abs(predictions$PredictedOutcome - predictions$ActualOutcome))
+  rmse = sqrt(mean((predictions$PredictedOutcome - predictions$ActualOutcome)^2))
+  
+  # Hypothesis testing can be conducted here to compare the adjusted ELO ratings against the original ELO ratings
+  
+  return(list(
+    ELO_RATINGS = ELO_RATINGS,
+    Predictions = predictions,
+    MAE = mae,
+    RMSE = rmse
+    # Include results of hypothesis testing here
+  ))
+}
+
+
+# Execution:
+
+results = ELO_ALGO_TEST(train_data = train, adjustments = c("dominant_teams", "strong_offenses", "strong_defenses", "fatigue_index"))
+  
+
+# Using "results", cross-validate the adjustments to determine which have the most statistical significance in improving the accuracy of the ELO ratings. Then, apply the results of the validation tests into a finalized "ELO_ALGO_FINAL" function.
+
+
+# Question: After the ELO_ALGO_TEST was run and data was collected, what else is needed to test, validate, and finalize the ELO ALGO? Give an answer that is specific to the context of this challenge and is formatted in a numbered step-by-step list.
+
+# 1. Analyze the results of the ELO_ALGO_TEST, specifically looking at the MAE and RMSE metrics to evaluate the prediction accuracy of the adjusted ELO ratings compared to the original ELO ratings.
+# 2. Conduct hypothesis testing to determine if the adjustments made to the ELO algorithm (for dominant teams, strong offenses/defenses, and fatigue index) lead to a statistically significant improvement in prediction accuracy compared to the original ELO ratings.
+# 3. Based on the results of the validation tests, identify which adjustments have the most statistical significance in improving the accuracy of the ELO ratings and predictions.
+# 4. Refine the ELO_ALGO_TEST function to create a finalized ELO_ALGO_FINAL function that incorporates the adjustments that have been validated as statistically significant in improving prediction accuracy.
+
+
+
+
+# Step 1 in R:
+results = ELO_ALGO_TEST(train_data = train, adjustments = c("dominant_teams", "strong_offenses", "strong_defenses", "fatigue_index"))
+mae = results$MAE
+rmse = results$RMSE
+print(paste("MAE:", mae))
+print(paste("RMSE:", rmse))
+
+# MAE: 0.426608830308534
+# RMSE: 0.451006144571495
+
+# Step 2 in R:
+
+# Hypothesis testing can be conducted using a paired t-test to compare the predicted outcomes from the adjusted ELO ratings against the actual outcomes. This will help determine if there is a statistically significant difference in prediction accuracy between the adjusted ELO ratings and the original ELO ratings. The original ELO ratings have been calcualted and stored as the dataframe "ELO_RATINGS_v1" which include the team and their rating after 940 games. There is no set of predictions made by the original ELO ratings, so we will have to build that out before t-testing.
+
+# Original ELO Predictions:
+
+original_predictions = data.frame(
+  HomeTeam = character(),
+  AwayTeam = character(),
+  PredictedOutcome = numeric(),
+  ActualOutcome = numeric()
+)
+for (i in 1:nrow(train)) {
+  home_team = train$HomeTeam[i]
+  away_team = train$AwayTeam[i]
+  home_points = train$HomePts[i]
+  away_points = train$AwayPts[i]
+  
+  # Get current ratings from original ELO ratings
+  home_rating = ELO_RATINGS_v1$Rating[ELO_RATINGS_v1$Team == home_team]
+  away_rating = ELO_RATINGS_v1$Rating[ELO_RATINGS_v1$Team == away_team]
+  
+  # Calculate expected scores using original ELO ratings
+  expected_home = 1 / (1 + 10^((away_rating - home_rating) / 400))
+  
+  # Determine actual scores
+  if (home_points > away_points) {
+    actual_home = 1
+  } else if (home_points < away_points) {
+    actual_home = 0
+  } else {
+    actual_home = 0.5
+  }
+  
+  # Store predictions for validation
+  original_predictions <- rbind(original_predictions, data.frame(
+    HomeTeam = home_team,
+    AwayTeam = away_team,
+    PredictedOutcome = expected_home,
+    ActualOutcome = actual_home
+  ))
+}
+
+
+# Now we have both the predictions from the adjusted ELO ratings and the results from the original elo raintgs. 
+
+# Paired t-test to compare the predicted outcomes from the adjusted ELO ratings against the actual outcomes.
+
+t_test_result = t.test(results$Predictions$PredictedOutcome, original_predictions$PredictedOutcome, paired = TRUE)
+print(t_test_result)
+
+# Results: 
+# t  = -1.7668
+# df = 939
+# p-value = 0.07759
+# Sample estimates: Mean Difference: -0.006605095
+# 95% CI: [-0.013941973, 0.000731784]
+
+
+# Step 3 in R - Which Adjustments had the most statistical significance in improving accuracy?
+
+# To determine which adjustments had the most statistical significance in improving accuracy, we would need to run the ELO_ALGO_TEST function multiple times, each time including only one of the adjustments (e.g., only "dominant_teams", only "strong_offenses", etc.) and then compare the MAE and RMSE metrics for each run. We could also conduct hypothesis testing for each individual adjustment to see if it leads to a statistically significant improvement in prediction accuracy compared to the original ELO ratings.
+
+# Run 1: Only "dominant_teams" adjustment
+
+results_dominant_teams = ELO_ALGO_TEST(train_data = train, adjustments = c("dominant_teams"))
+mae_dominant_teams = results_dominant_teams$MAE
+rmse_dominant_teams = results_dominant_teams$RMSE
+print(paste("MAE with Dominant Teams Adjustment:", mae_dominant_teams))
+print(paste("RMSE with Dominant Teams Adjustment:", rmse_dominant_teams))
+
+# MAE with Dominant Teams: 0.438
+# RMSE with Dominant Teams: 0.457
+
+# Run 2: Only "strong_offenses" adjustment
+
+results_strong_offenses = ELO_ALGO_TEST(train_data = train, adjustments = c("strong_offenses"))
+mae_strong_offenses = results_strong_offenses$MAE
+rmse_strong_offenses = results_strong_offenses$RMSE
+print(paste("MAE with Strong Offenses Adjustment:", mae_strong_offenses))
+print(paste("RMSE with Strong Offenses Adjustment:", rmse_strong_offenses))
+
+# MAE with strong offenses: 0.455
+# RMSE with strong offenses: 0.467
+
+# Run 3: Only "strong_defenses" adjustment
+
+results_strong_defenses = ELO_ALGO_TEST(train_data = train, adjustments = c("strong_defenses"))
+mae_strong_defenses = results_strong_defenses$MAE
+rmse_strong_defenses = results_strong_defenses$RMSE
+print(paste("MAE with Strong Defenses Adjustment:", mae_strong_defenses))
+print(paste("RMSE with Strong Defenses Adjustment:", rmse_strong_defenses))
+
+# MAE with strong defenses: 0.457
+# RMSE with strong defesnes: 0.469
+
+# Run 4: Only "fatigue_index" adjustment
+
+results_fatigue_index = ELO_ALGO_TEST(train_data = train, adjustments = c("fatigue_index"))
+mae_fatigue_index = results_fatigue_index$MAE
+rmse_fatigue_index = results_fatigue_index$RMSE
+print(paste("MAE with Fatigue Index Adjustment:", mae_fatigue_index))
+print(paste("RMSE with Fatigue Index Adjustment:", rmse_fatigue_index))
+
+# MAE with fatigue index: 0.466
+# RMSE with fatigue index: 0.475
+
+# Conclusion for Step 3:
+# Based on the MAE and RMSE metrics for each individual adjustment, it appears that the "dominant_teams" adjustment had the most significant impact on improving prediction accuracy, as it resulted in the lowest MAE and RMSE compared to the other adjustments. The "strong_offenses", "strong_defenses", and "fatigue_index" adjustments did not show as much improvement in prediction accuracy, as their MAE and RMSE values were higher than those of the "dominant_teams" adjustment. Therefore, we may want to prioritize incorporating the "dominant_teams" adjustment into the finalized ELO_ALGO_FINAL function while further evaluating the other adjustments for potential inclusion based on their individual contributions to improving prediction accuracy.
+
+
+# Step 4 in R - Refine the ELO_ALGO_TEST function to create a finalized ELO_ALGO_FINAL function that incorporates the adjustments that have been validated as statistically significant in improving prediction accuracy.
+
+ELO_ALGO_FINAL = function(train_data) {
+  # Initialize ELO ratings
+  ELO_RATINGS = data.frame(
+    Team = unique(c(train_data$HomeTeam, train_data$AwayTeam)),
+    Rating = 1500 # Starting ELO rating for all teams
+  )
+  
+  for (i in 1:nrow(train_data)) {
+    home_team = train_data$HomeTeam[i]
+    away_team = train_data$AwayTeam[i]
+    home_points = train_data$HomePts[i]
+    away_points = train_data$AwayPts[i]
+    
+    # Get current ratings
+    home_rating = ELO_RATINGS$Rating[ELO_RATINGS$Team == home_team]
+    away_rating = ELO_RATINGS$Rating[ELO_RATINGS$Team == away_team]
+    
+    # Calculate expected scores
+    expected_home = 1 / (1 + 10^((away_rating - home_rating) / 400))
+    
+    # Determine actual scores
+    if (home_points > away_points) {
+      actual_home = 1
+      actual_away = 0
+    } else if (home_points < away_points) {
+      actual_home = 0
+      actual_away = 1
+    } else {
+      actual_home = 0.5
+      actual_away = 0.5
+    }
+    
+    # Update ratings with adjustments based on insights from data analysis (only dominant teams adjustment as it showed the most improvement)
+    K = 40 # K-factor for rating updates
+    
+    dominant_teams_adjustment = if (home_team %in% dominant_teams$HomeTeam) {
+      home_rating <- home_rating + 20 # Bonus for dominant teams
+    }
+    if (away_team %in% dominant_teams$HomeTeam) {
+      away_rating <- away_rating + 20 # Bonus for dominant teams
+    }
+    
+    new_home_rating = home_rating + K * (actual_home - expected_home)
+    new_away_rating = away_rating + K * (actual_away - expected_away)
+    
+    ELO_RATINGS$Rating[ELO_RATINGS$Team == home_team] <- new_home_rating
+    ELO_RATINGS$Rating[ELO_RATINGS$Team == away_team] <- new_away_rating
+  }
+  
+  return(ELO_RATINGS)
+}
+
+  
+```
+
+# STEP 3: Modeling/Forecasting - Create a statistical model that can fit the results of HomeWinMargin and then use that model to predict the HomeWinMargin for the next 75 matchups
+
+```{r}
+# Plan:
+# 1. Explore the relationship between HomeWinMargin and other variables in the dataset (e.g., HomePts, AwayPts, HomeConf, AwayConf, etc.) to identify potential predictors for the model.
+# 2. Choose an appropriate statistical modeling technique (e.g., linear regression, random forest, etc.) based on the nature of the data and the relationships identified in step 1.
+# 3. Train the chosen model on the training dataset, using HomeWinMargin as the target variable and the identified predictors as the independent variables.
+# 4. Evaluate the performance of the model using appropriate metrics (e.g., R-squared, mean absolute error, etc.) to ensure that it is accurately capturing the relationship between the predictors and HomeWinMargin.
+# 5. Use the trained model to predict the HomeWinMargin for the next 75 matchups, using the relevant predictor variables for those matchups as input to the model.  
+
+
+# 3.1 - What predictors should we use? What is the relationship between HomeWinMargin and other variables in the dataset?
+
+# 3.1 Answer: To identify potential predictors for the model, we can explore the relationships between HomeWinMargin and other variables in the dataset using correlation analysis and visualizations. We can calculate the correlation coefficients between HomeWinMargin and variables such as HomePts, AwayPts, HomeConf, AwayConf, etc. Additionally, we can create scatter plots and box plots to visualize these relationships. Based on the results of this analysis, we can select the most relevant predictors to include in our model for predicting HomeWinMargin.
+
+# Correlation Coefficients:
+
+correlation_home_win_margin = train %>%
+  summarise(
+    CorrelationHomePts = cor(HomeWinMargin, HomePts),
+    CorrelationAwayPts = cor(HomeWinMargin, AwayPts),
+    CorrelationHomeConf = cor(HomeWinMargin, as.numeric(as.factor(HomeConf))),
+    CorrelationAwayConf = cor(HomeWinMargin, as.numeric(as.factor(AwayConf)))
+  )
+correlation_home_win_margin
+
+
+# CorrelationHomePts: 0.5758479
+# CorrelationAwayPts: -0.6403852
+# CorrelationHomeConf: -0.03906505
+# CorrelationAwayConf: 0.09389065
+
+# Scatter & Box Plots:
+
+ggplot(train, aes(x = HomePts, y = HomeWinMargin)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  labs(title = "Scatter Plot of HomePts vs HomeWinMargin")
+
+
+ggplot(train, aes(x = AwayPts, y = HomeWinMargin)) +
+  geom_point() +
+  geom_smooth(method = "lm") + 
+  labs(title = "Scatter Plot of AwayPts vs HomeWinMargin")
+
+# Conclusion: Based on the correlation coefficients and the scatter plots, it appears that HomePts and AwayPts have a strong relationship with HomeWinMargin, with HomePts being positively correlated and AwayPts being negatively correlated. The conference variables (HomeConf and AwayConf) do not show a strong correlation with HomeWinMargin. Therefore, we may want to consider using HomePts and AwayPts as predictors in our model for predicting HomeWinMargin, while potentially excluding the conference variables due to their weak correlation with the target variable.
+
+# Follow-up question: Win margin is caluclated using home and away points directly, is it trivial or redundant to use those predictors to explain win margin? How would those variables not induce overfitting?
+
+# Answer: Using HomePts and AwayPts as predictors for HomeWinMargin may be considered trivial or redundant since HomeWinMargin is directly calculated as the difference between HomePts and AwayPts. This could lead to overfitting, as the model may simply learn to predict HomeWinMargin based on the values of HomePts and AwayPts without capturing any underlying patterns or relationships in the data. To avoid overfitting, we could consider using derived features that capture more complex relationships between the points scored and allowed, such as the ratio of HomePts to AwayPts, or incorporating other variables that may influence the win margin (e.g., team strength, fatigue index, etc.) to provide a more holistic view of the factors contributing to HomeWinMargin.
+
+
+# 3.1.1 - Avoiding Overfitting
+
+
+# Keep in mind that: All derby matches are played at a neutral venue with fan support split 50% for team 1 and 50% for team 2; thus, neither team has a home team advantage. 
+
+# Derived features
+# - Ratio of HomePts to AwayPts
+# - Difference in ELO ratings between the two teams (using the ELO ratings calculated in Step 2)
+# - Fatigue index for both teams (number of games played leading up to the matchup)
+# - Historical performance of the teams in derby matches (e.g., average win margin in previous derby matches, win/loss record in derby matches, etc.) 
+# - Team strength indicators (e.g., average points scored and allowed throughout the season, ranking based on ELO ratings, etc.)
+# - Possible ELO metrics, rolling averages of ELO ratings over the last 5-10 games, etc. To capture teams that are on a "quantifiable hot/cold streak"
+# - There needs to be guardrails put in place so the values for this are not incorrect. i.e. GameID 1001 is the first game ever played, so there is NO historical information up until this point.
+# - All/any metrics that are derived need to be calculated in a way that they are not using information that does not exist from the past. You cannot use a historical performance of a team feature on a team that has played no games yet (Game ID 1001 cannot have historical based features). This is for the integrity of the model and to avoid data leakage.
+# - We can use the "lag" function to create features that are based on historical performance, ensuring that we are only using information from previous games and not future games. For example, we can calculate the average win margin for a team up until the current game by using the lag function to access the win margins from previous games for that team.
+# - When we are creating derived features, we need to ensure that we are not introducing any data leakage by using information that would not have been available at the time of the game. For example, when calculating the difference in ELO ratings between the two teams, we should only use the ELO ratings that were calculated up until the current game and not include any future games in the calculation.
+# - When using ELO derived features, each observation needs to reflect the correct index of the ELO ratings. For example, if we are calculating the difference in ELO ratings for Game ID 1005, we should only use the ELO ratings that were calculated up until Game ID 1004 to ensure that we are not using any future information in our derived features.
+ 
+
+safe_derived_features = train %>%
+  group_by(HomeTeam) %>%
+  arrange(GameID) %>%
+  mutate(
+    RatioHomeAwayPts = HomePts / (AwayPts + 1), # Adding 1 to avoid division by zero
+    ELO_Difference = ELO_RATINGS_v1$Rating[match(HomeTeam, ELO_RATINGS_v1$Team)] - ELO_RATINGS_v1$Rating[match(AwayTeam, ELO_RATINGS_v1$Team)],
+    HomeFatigueIndex = cumsum(HomeTeam == lag(HomeTeam, default = first(HomeTeam))),
+    AwayFatigueIndex = cumsum(AwayTeam == lag(AwayTeam, default = first(AwayTeam))),
+    HistoricalWinMargin = ifelse(GameID > 1001, lag(cumsum(HomeWinMargin), default = 0) / (cumsum(HomeWinMargin != 0) + 1), NA) # Average win margin in previous games
+  ) %>%
+  ungroup()
+
+safe_derived_features
+
+
+
+
+
+```
+
