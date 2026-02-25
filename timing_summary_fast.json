@@ -1,0 +1,193 @@
+{
+  "budget": {
+    "elapsed_sec": 16.902387099999032,
+    "events": [
+      "max_fits: fit cap reached before ridge; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before ridge; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before ridge; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before ridge; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before ridge; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before ridge; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before ridge; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before ridge; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before ridge; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before ridge; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before huber; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb; requested=1, used=120, budget=120",
+      "histgb_bag_auto_reduce: Reduced HistGB bagging to 1 model due tight fit budget.",
+      "max_fits: fit cap reached before histgb_bag; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb_q50; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before ridge; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before huber; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb; requested=1, used=120, budget=120",
+      "histgb_bag_auto_reduce: Reduced HistGB bagging to 1 model due tight fit budget.",
+      "max_fits: fit cap reached before histgb_bag; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb_q50; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before ridge; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before huber; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb; requested=1, used=120, budget=120",
+      "histgb_bag_auto_reduce: Reduced HistGB bagging to 1 model due tight fit budget.",
+      "max_fits: fit cap reached before histgb_bag; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb_q50; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before ridge; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before huber; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb; requested=1, used=120, budget=120",
+      "histgb_bag_auto_reduce: Reduced HistGB bagging to 1 model due tight fit budget.",
+      "max_fits: fit cap reached before histgb_bag; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb_q50; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before ridge; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before huber; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb; requested=1, used=120, budget=120",
+      "histgb_bag_auto_reduce: Reduced HistGB bagging to 1 model due tight fit budget.",
+      "max_fits: fit cap reached before histgb_bag; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb_q50; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before ridge; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before huber; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb; requested=1, used=120, budget=120",
+      "histgb_bag_auto_reduce: Reduced HistGB bagging to 1 model due tight fit budget.",
+      "max_fits: fit cap reached before histgb_bag; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb_q50; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before ridge; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before huber; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb; requested=1, used=120, budget=120",
+      "histgb_bag_auto_reduce: Reduced HistGB bagging to 1 model due tight fit budget.",
+      "max_fits: fit cap reached before histgb_bag; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb_q50; requested=1, used=120, budget=120"
+    ],
+    "fit_count": 120,
+    "triggered": {
+      "histgb_bag_auto_reduce": true,
+      "max_fits": true
+    }
+  },
+  "focus_phase_counts": {
+    "_build_split_tables": 16,
+    "_core_scan_score": 54,
+    "_generate_inner_oof_and_outer_preds": 6,
+    "_predict_family": 173,
+    "_prepare_variant_outer_data": 8,
+    "_scan_and_select_core_candidates": 2
+  },
+  "focus_phase_totals_sec": {
+    "_build_split_tables": 0.33393799999248586,
+    "_core_scan_score": 5.516052900009527,
+    "_generate_inner_oof_and_outer_preds": 3.973329599997669,
+    "_predict_family": 9.41622600001574,
+    "_prepare_variant_outer_data": 0.4404227999912109,
+    "_scan_and_select_core_candidates": 5.523646600002394
+  },
+  "generated_at_utc": "2026-02-25T02:37:37.662574+00:00",
+  "model_fit_counts_by_family": {
+    "histgb": 51,
+    "histgb_bag": 6,
+    "histgb_q50": 6,
+    "huber": 6,
+    "ridge": 51
+  },
+  "phase_counts": {
+    "_build_split_tables": 16,
+    "_core_scan_score": 54,
+    "_generate_inner_oof_and_outer_preds": 6,
+    "_predict_family": 173,
+    "_predict_family_bundle": 67,
+    "_prepare_prediction_matrices": 11,
+    "_prepare_variant_outer_data": 8,
+    "_scan_and_select_core_candidates": 2,
+    "run_nextgen_pipeline_total": 1
+  },
+  "phase_totals_sec": {
+    "_build_split_tables": 0.33393799999248586,
+    "_core_scan_score": 5.516052900009527,
+    "_generate_inner_oof_and_outer_preds": 3.973329599997669,
+    "_predict_family": 9.41622600001574,
+    "_predict_family_bundle": 9.438436200001888,
+    "_prepare_prediction_matrices": 0.018517500004236354,
+    "_prepare_variant_outer_data": 0.4404227999912109,
+    "_scan_and_select_core_candidates": 5.523646600002394,
+    "run_nextgen_pipeline_total": 16.902191400000447
+  },
+  "predict_family_call_counts": {
+    "histgb": 67,
+    "histgb_bag": 13,
+    "histgb_q50": 13,
+    "huber": 13,
+    "ridge": 67
+  },
+  "predict_family_totals_sec": {
+    "histgb": 6.101998400012235,
+    "histgb_bag": 0.7200957999957609,
+    "histgb_q50": 0.9633782000055362,
+    "huber": 1.5091032000018458,
+    "ridge": 0.12165040000036242
+  },
+  "runtime_config": {
+    "enable_optimizations": true,
+    "fast_mode": true,
+    "histgb_bag_n_models": 1,
+    "max_fits": 120,
+    "max_scan_seconds": 30,
+    "max_total_seconds": 180
+  },
+  "seed": 23,
+  "top_slowest_events": [
+    {
+      "detail": "total",
+      "phase": "run_nextgen_pipeline_total",
+      "sec": 16.902191400000447
+    },
+    {
+      "detail": "",
+      "phase": "_scan_and_select_core_candidates",
+      "sec": 2.904006400000071
+    },
+    {
+      "detail": "",
+      "phase": "_scan_and_select_core_candidates",
+      "sec": 2.6196402000023227
+    },
+    {
+      "detail": "",
+      "phase": "_generate_inner_oof_and_outer_preds",
+      "sec": 1.47304929999882
+    },
+    {
+      "detail": "",
+      "phase": "_generate_inner_oof_and_outer_preds",
+      "sec": 1.4279552000007243
+    },
+    {
+      "detail": "",
+      "phase": "_generate_inner_oof_and_outer_preds",
+      "sec": 1.0605995999976585
+    },
+    {
+      "detail": "ridge|huber|histgb|histgb_bag|histgb_q50",
+      "phase": "_predict_family_bundle",
+      "sec": 0.8823224999978265
+    },
+    {
+      "detail": "ridge|huber|histgb|histgb_bag|histgb_q50",
+      "phase": "_predict_family_bundle",
+      "sec": 0.8766949999990175
+    },
+    {
+      "detail": "ridge|huber|histgb|histgb_bag|histgb_q50",
+      "phase": "_predict_family_bundle",
+      "sec": 0.6083743999988656
+    },
+    {
+      "detail": "ridge|huber|histgb|histgb_bag|histgb_q50",
+      "phase": "_predict_family_bundle",
+      "sec": 0.593923000000359
+    }
+  ]
+}

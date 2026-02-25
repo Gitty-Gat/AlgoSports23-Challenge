@@ -1,0 +1,163 @@
+{
+  "budget": {
+    "elapsed_sec": 18.069392400000652,
+    "events": [
+      "max_fits: fit cap reached before ridge; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before huber; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb; requested=1, used=120, budget=120",
+      "histgb_bag_auto_reduce: Reduced HistGB bagging to 1 model due tight fit budget.",
+      "max_fits: fit cap reached before histgb_bag; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb_q50; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before ridge; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before huber; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb; requested=1, used=120, budget=120",
+      "histgb_bag_auto_reduce: Reduced HistGB bagging to 1 model due tight fit budget.",
+      "max_fits: fit cap reached before histgb_bag; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb_q50; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before ridge; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before huber; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb; requested=1, used=120, budget=120",
+      "histgb_bag_auto_reduce: Reduced HistGB bagging to 1 model due tight fit budget.",
+      "max_fits: fit cap reached before histgb_bag; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb_q50; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before ridge; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before huber; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb; requested=1, used=120, budget=120",
+      "histgb_bag_auto_reduce: Reduced HistGB bagging to 1 model due tight fit budget.",
+      "max_fits: fit cap reached before histgb_bag; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb_q50; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before ridge; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before huber; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb; requested=1, used=120, budget=120",
+      "histgb_bag_auto_reduce: Reduced HistGB bagging to 1 model due tight fit budget.",
+      "max_fits: fit cap reached before histgb_bag; requested=1, used=120, budget=120",
+      "max_fits: fit cap reached before histgb_q50; requested=1, used=120, budget=120"
+    ],
+    "fit_count": 120,
+    "triggered": {
+      "histgb_bag_auto_reduce": true,
+      "max_fits": true
+    }
+  },
+  "focus_phase_counts": {
+    "_build_split_tables": 16,
+    "_core_scan_score": 40,
+    "_generate_inner_oof_and_outer_preds": 6,
+    "_predict_family": 145,
+    "_prepare_variant_outer_data": 8,
+    "_scan_and_select_core_candidates": 2
+  },
+  "focus_phase_totals_sec": {
+    "_build_split_tables": 0.4468479999995907,
+    "_core_scan_score": 5.226144499993097,
+    "_generate_inner_oof_and_outer_preds": 5.5399299999953655,
+    "_predict_family": 10.500255799976003,
+    "_prepare_variant_outer_data": 0.5499574000059511,
+    "_scan_and_select_core_candidates": 5.230000300001848
+  },
+  "generated_at_utc": "2026-02-25T02:37:10.189019+00:00",
+  "model_fit_counts_by_family": {
+    "histgb": 48,
+    "histgb_bag": 8,
+    "histgb_q50": 8,
+    "huber": 8,
+    "ridge": 48
+  },
+  "phase_counts": {
+    "_build_split_tables": 16,
+    "_core_scan_score": 40,
+    "_generate_inner_oof_and_outer_preds": 6,
+    "_predict_family": 145,
+    "_predict_family_bundle": 145,
+    "_prepare_prediction_matrices": 145,
+    "_prepare_variant_outer_data": 8,
+    "_scan_and_select_core_candidates": 2,
+    "run_nextgen_pipeline_total": 1
+  },
+  "phase_totals_sec": {
+    "_build_split_tables": 0.4468479999995907,
+    "_core_scan_score": 5.226144499993097,
+    "_generate_inner_oof_and_outer_preds": 5.5399299999953655,
+    "_predict_family": 10.500255799976003,
+    "_predict_family_bundle": 10.723592700000154,
+    "_prepare_prediction_matrices": 0.2154835999790521,
+    "_prepare_variant_outer_data": 0.5499574000059511,
+    "_scan_and_select_core_candidates": 5.230000300001848,
+    "run_nextgen_pipeline_total": 18.068706599999132
+  },
+  "predict_family_call_counts": {
+    "histgb": 53,
+    "histgb_bag": 13,
+    "histgb_q50": 13,
+    "huber": 13,
+    "ridge": 53
+  },
+  "predict_family_totals_sec": {
+    "histgb": 5.971199199975672,
+    "histgb_bag": 0.9772932000087167,
+    "histgb_q50": 1.3054671000027156,
+    "huber": 2.1258023000009416,
+    "ridge": 0.12049399998795707
+  },
+  "runtime_config": {
+    "enable_optimizations": false,
+    "fast_mode": true,
+    "histgb_bag_n_models": 1,
+    "max_fits": 120,
+    "max_scan_seconds": 30,
+    "max_total_seconds": 180
+  },
+  "seed": 23,
+  "top_slowest_events": [
+    {
+      "detail": "total",
+      "phase": "run_nextgen_pipeline_total",
+      "sec": 18.068706599999132
+    },
+    {
+      "detail": "",
+      "phase": "_scan_and_select_core_candidates",
+      "sec": 3.3100085000005492
+    },
+    {
+      "detail": "",
+      "phase": "_scan_and_select_core_candidates",
+      "sec": 1.9199918000012985
+    },
+    {
+      "detail": "",
+      "phase": "_generate_inner_oof_and_outer_preds",
+      "sec": 1.509536499997921
+    },
+    {
+      "detail": "",
+      "phase": "_generate_inner_oof_and_outer_preds",
+      "sec": 1.4670594000017445
+    },
+    {
+      "detail": "",
+      "phase": "_generate_inner_oof_and_outer_preds",
+      "sec": 1.4495084999980463
+    },
+    {
+      "detail": "",
+      "phase": "_generate_inner_oof_and_outer_preds",
+      "sec": 1.0776697999972384
+    },
+    {
+      "detail": "huber",
+      "phase": "_predict_family_bundle",
+      "sec": 0.38370369999756804
+    },
+    {
+      "detail": "huber",
+      "phase": "_predict_family",
+      "sec": 0.38222029999815277
+    },
+    {
+      "detail": "",
+      "phase": "_core_scan_score",
+      "sec": 0.30335489999924903
+    }
+  ]
+}

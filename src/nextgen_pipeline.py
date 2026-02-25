@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 import random
 import re
 import textwrap
+import time
 import warnings
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
@@ -103,6 +106,284 @@ class PostprocessModel:
     regime_summary: pd.DataFrame
     calibration_summary: pd.DataFrame
     scale_summary: pd.DataFrame
+
+
+@dataclass
+class RuntimeProfiler:
+    totals: Dict[str, float] = field(default_factory=dict)
+    counts: Dict[str, int] = field(default_factory=dict)
+    model_fit_counts: Dict[str, int] = field(default_factory=dict)
+    events: List[dict] = field(default_factory=list)
+
+    def add(self, phase: str, elapsed_sec: float, *, detail: Optional[str] = None) -> None:
+        if not np.isfinite(elapsed_sec):
+            return
+        self.totals[phase] = float(self.totals.get(phase, 0.0) + float(elapsed_sec))
+        self.counts[phase] = int(self.counts.get(phase, 0) + 1)
+        self.events.append({"phase": str(phase), "detail": "" if detail is None else str(detail), "sec": float(elapsed_sec)})
+
+    def add_model_fit(self, family: str, n: int = 1) -> None:
+        self.model_fit_counts[str(family)] = int(self.model_fit_counts.get(str(family), 0) + int(n))
+
+
+@dataclass
+class RuntimeConfig:
+    max_total_seconds: int = 600
+    max_scan_seconds: int = 120
+    max_fits: int = 400
+    fast_mode: bool = True
+    enable_optimizations: bool = True
+    histgb_max_iter_cap: int = 60
+    histgb_bag_n_models: int = 2
+    scan_prune_keep_top_n: int = 25
+    scan_prune_keep_frac: float = 0.35
+    scan_top_candidates_return: int = 3
+    fast_outer_folds: int = 1
+    fast_inner_folds: int = 1
+    fast_scan_topn: int = 20
+    fast_disable_q20_q80: bool = True
+    fast_post_grid_limit: int = 8
+
+
+@dataclass
+class BudgetController:
+    cfg: RuntimeConfig
+    start_perf: float = field(default_factory=time.perf_counter)
+    fit_count: int = 0
+    triggered: Dict[str, Any] = field(default_factory=dict)
+    events: List[str] = field(default_factory=list)
+
+    def elapsed(self) -> float:
+        return float(time.perf_counter() - self.start_perf)
+
+    def note(self, code: str, message: str) -> None:
+        if code not in self.triggered:
+            self.triggered[code] = True
+        self.events.append(f"{code}: {message}")
+
+    def total_exceeded(self) -> bool:
+        if self.cfg.max_total_seconds <= 0:
+            return False
+        hit = self.elapsed() > float(self.cfg.max_total_seconds)
+        if hit:
+            self.note("max_total_seconds", f"elapsed={self.elapsed():.1f}s > budget={self.cfg.max_total_seconds}s")
+        return hit
+
+    def scan_exceeded(self, scan_start_elapsed: float) -> bool:
+        if self.cfg.max_scan_seconds <= 0:
+            return False
+        scan_elapsed = self.elapsed() - float(scan_start_elapsed)
+        hit = scan_elapsed > float(self.cfg.max_scan_seconds)
+        if hit:
+            self.note("max_scan_seconds", f"scan_elapsed={scan_elapsed:.1f}s > budget={self.cfg.max_scan_seconds}s")
+        return hit
+
+    def try_reserve_fits(self, n: int, family: str) -> bool:
+        n = int(max(n, 0))
+        if n == 0:
+            return True
+        if self.cfg.max_fits > 0 and (self.fit_count + n) > int(self.cfg.max_fits):
+            self.note(
+                "max_fits",
+                f"fit cap reached before {family}; requested={n}, used={self.fit_count}, budget={self.cfg.max_fits}",
+            )
+            return False
+        self.fit_count += n
+        return True
+
+    def remaining_fits(self) -> int:
+        if self.cfg.max_fits <= 0:
+            return 10**9
+        return max(int(self.cfg.max_fits) - int(self.fit_count), 0)
+
+
+@dataclass
+class PreparedMatrixBundle:
+    X_train: np.ndarray
+    y_train: np.ndarray
+    X_val: np.ndarray
+    sample_weight: np.ndarray
+
+
+_ACTIVE_PROFILER: Optional[RuntimeProfiler] = None
+_ACTIVE_RUNTIME_CFG: Optional[RuntimeConfig] = None
+_ACTIVE_BUDGET: Optional[BudgetController] = None
+_PIPELINE_START_PERF: Optional[float] = None
+_PREP_CACHE: Dict[Any, PreparedMatrixBundle] = {}
+_BUILD_SPLIT_TABLES_CACHE: Dict[Any, tuple[pd.DataFrame, pd.DataFrame, Any]] = {}
+_PREPARE_VARIANT_CACHE: Dict[Any, dict] = {}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, str(default))
+    try:
+        return int(str(raw).strip())
+    except Exception:
+        return int(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, str(default))
+    try:
+        return float(str(raw).strip())
+    except Exception:
+        return float(default)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    s = str(raw).strip().lower()
+    if s in {"1", "true", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(default)
+
+
+def _load_runtime_config_from_env() -> RuntimeConfig:
+    fast_mode = _env_bool("ALGOSPORTS_FAST_MODE", True)
+    enable_optimizations = _env_bool("ALGOSPORTS_ENABLE_OPTIMIZATIONS", True)
+    bag_default = 1 if fast_mode else 2
+    cfg = RuntimeConfig(
+        max_total_seconds=_env_int("ALGOSPORTS_MAX_TOTAL_SECONDS", 600),
+        max_scan_seconds=_env_int("ALGOSPORTS_MAX_SCAN_SECONDS", 120),
+        max_fits=_env_int("ALGOSPORTS_MAX_FITS", 400),
+        fast_mode=bool(fast_mode),
+        enable_optimizations=bool(enable_optimizations),
+        histgb_max_iter_cap=_env_int("ALGOSPORTS_FAST_HISTGB_MAX_ITER_CAP", 60),
+        histgb_bag_n_models=_env_int("ALGOSPORTS_HISTGB_BAG_N_MODELS", bag_default),
+        scan_prune_keep_top_n=_env_int("ALGOSPORTS_SCAN_PRUNE_TOPN", 25),
+        scan_prune_keep_frac=_env_float("ALGOSPORTS_SCAN_PRUNE_FRAC", 0.35),
+        scan_top_candidates_return=_env_int("ALGOSPORTS_SCAN_RETURN_TOP", 3),
+        fast_outer_folds=_env_int("ALGOSPORTS_FAST_OUTER_FOLDS", 1),
+        fast_inner_folds=_env_int("ALGOSPORTS_FAST_INNER_FOLDS", 1),
+        fast_scan_topn=_env_int("ALGOSPORTS_FAST_SCAN_TOPN", 20),
+        fast_disable_q20_q80=_env_bool("ALGOSPORTS_FAST_SKIP_Q20_Q80", True),
+        fast_post_grid_limit=_env_int("ALGOSPORTS_FAST_POST_GRID_LIMIT", 8),
+    )
+    cfg.histgb_bag_n_models = max(1, int(cfg.histgb_bag_n_models))
+    cfg.scan_prune_keep_top_n = max(1, int(cfg.scan_prune_keep_top_n))
+    cfg.scan_top_candidates_return = max(1, int(cfg.scan_top_candidates_return))
+    cfg.fast_outer_folds = max(1, int(cfg.fast_outer_folds))
+    cfg.fast_inner_folds = max(1, int(cfg.fast_inner_folds))
+    cfg.fast_scan_topn = max(1, int(cfg.fast_scan_topn))
+    cfg.fast_post_grid_limit = max(1, int(cfg.fast_post_grid_limit))
+    cfg.scan_prune_keep_frac = float(np.clip(float(cfg.scan_prune_keep_frac), 0.05, 1.0))
+    return cfg
+
+
+def now_seconds() -> float:
+    if _PIPELINE_START_PERF is None:
+        return float(time.perf_counter())
+    return float(time.perf_counter() - float(_PIPELINE_START_PERF))
+
+
+def _budget() -> Optional[BudgetController]:
+    return _ACTIVE_BUDGET
+
+
+def _runtime_cfg() -> RuntimeConfig:
+    return _ACTIVE_RUNTIME_CFG if _ACTIVE_RUNTIME_CFG is not None else RuntimeConfig()
+
+
+def _budget_total_exceeded() -> bool:
+    b = _budget()
+    return bool(b.total_exceeded()) if b is not None else False
+
+
+def _budget_scan_exceeded(scan_start_elapsed: float) -> bool:
+    b = _budget()
+    return bool(b.scan_exceeded(scan_start_elapsed)) if b is not None else False
+
+
+
+@contextmanager
+def _timed_phase(phase: str, *, detail: Optional[str] = None):
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        profiler = _ACTIVE_PROFILER
+        if profiler is not None:
+            profiler.add(phase, time.perf_counter() - t0, detail=detail)
+
+
+def _record_model_fit_count(family: str, n: int = 1) -> None:
+    profiler = _ACTIVE_PROFILER
+    if profiler is not None:
+        profiler.add_model_fit(family, n=n)
+
+
+def _timing_summary_dict(profiler: Optional[RuntimeProfiler], top_n: int = 10) -> dict:
+    if profiler is None:
+        return {
+            "phase_totals_sec": {},
+            "phase_counts": {},
+            "predict_family_totals_sec": {},
+            "predict_family_call_counts": {},
+            "model_fit_counts_by_family": {},
+            "top_slowest_events": [],
+        }
+    pf_events = [e for e in profiler.events if e["phase"] == "_predict_family"]
+    pf_totals: Dict[str, float] = {}
+    pf_counts: Dict[str, int] = {}
+    for e in pf_events:
+        fam = str(e.get("detail") or "unknown")
+        pf_totals[fam] = float(pf_totals.get(fam, 0.0) + float(e["sec"]))
+        pf_counts[fam] = int(pf_counts.get(fam, 0) + 1)
+    top_events = sorted(profiler.events, key=lambda x: float(x.get("sec", 0.0)), reverse=True)[: max(int(top_n), 1)]
+    return {
+        "phase_totals_sec": {k: float(v) for k, v in sorted(profiler.totals.items(), key=lambda kv: kv[0])},
+        "phase_counts": {k: int(v) for k, v in sorted(profiler.counts.items(), key=lambda kv: kv[0])},
+        "predict_family_totals_sec": {k: float(v) for k, v in sorted(pf_totals.items(), key=lambda kv: kv[1], reverse=True)},
+        "predict_family_call_counts": {k: int(v) for k, v in sorted(pf_counts.items(), key=lambda kv: kv[0])},
+        "model_fit_counts_by_family": {k: int(v) for k, v in sorted(profiler.model_fit_counts.items(), key=lambda kv: kv[0])},
+        "top_slowest_events": [
+            {"phase": str(e.get("phase", "")), "detail": str(e.get("detail", "")), "sec": float(e.get("sec", 0.0))}
+            for e in top_events
+        ],
+    }
+
+
+def _timing_summary_lines(summary: Mapping[str, Any], focus_phases: Optional[Sequence[str]] = None, top_n: int = 10) -> List[str]:
+    focus = list(focus_phases or [])
+    phase_totals = dict(summary.get("phase_totals_sec", {}) or {})
+    phase_counts = dict(summary.get("phase_counts", {}) or {})
+    pf_totals = dict(summary.get("predict_family_totals_sec", {}) or {})
+    pf_call_counts = dict(summary.get("predict_family_call_counts", {}) or {})
+    fit_counts = dict(summary.get("model_fit_counts_by_family", {}) or {})
+    lines = ["Runtime timing summary"]
+    if focus:
+        lines.append("Hotspot totals (sec):")
+        for name in focus:
+            lines.append(
+                f"- {name}: {float(phase_totals.get(name, 0.0)):.3f}s "
+                f"(calls={int(phase_counts.get(name, 0))})"
+            )
+    else:
+        lines.append("Phase totals (top by total sec):")
+        for name, sec in sorted(phase_totals.items(), key=lambda kv: float(kv[1]), reverse=True)[:10]:
+            lines.append(f"- {name}: {float(sec):.3f}s (calls={int(phase_counts.get(name, 0))})")
+    lines.append("Predict family totals (sec):")
+    for fam, sec in sorted(pf_totals.items(), key=lambda kv: float(kv[1]), reverse=True):
+        lines.append(f"- {fam}: {float(sec):.3f}s (calls={int(pf_call_counts.get(fam, 0))})")
+    lines.append("Model fit counts by family:")
+    for fam, cnt in sorted(fit_counts.items(), key=lambda kv: kv[0]):
+        lines.append(f"- {fam}: {int(cnt)}")
+    lines.append(f"Top {int(top_n)} slowest call sites / phases:")
+    for i, e in enumerate((summary.get("top_slowest_events", []) or [])[: max(int(top_n), 1)], start=1):
+        detail = str(e.get("detail", "") or "")
+        suffix = f" [{detail}]" if detail else ""
+        lines.append(f"{i}. {str(e.get('phase', ''))}{suffix}: {float(e.get('sec', 0.0)):.3f}s")
+    return lines
+
+
+def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
 
 
 def _set_deterministic(seed: int) -> None:
@@ -280,6 +561,52 @@ def _compute_time_decay_weights(dates: pd.Series, half_life_days: Optional[int])
     return np.clip(w, 0.05, 1.0)
 
 
+def _index_signature(index: pd.Index) -> tuple:
+    arr = np.asarray(index.to_numpy(), dtype=np.int64) if len(index) else np.asarray([], dtype=np.int64)
+    if arr.size == 0:
+        return (0, -1, -1, 0)
+    return (int(arr.size), int(arr[0]), int(arr[-1]), int(arr.sum()))
+
+
+def _feature_signature(feature_cols: Sequence[str]) -> tuple[str, ...]:
+    return tuple(str(c) for c in feature_cols)
+
+
+def _prep_cache_key(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    feature_cols: Sequence[str],
+    half_life_days: Optional[int],
+) -> tuple:
+    hl = None if half_life_days is None else int(half_life_days)
+    return (_index_signature(train_df.index), _index_signature(val_df.index), _feature_signature(feature_cols), hl)
+
+
+def _prepare_prediction_matrices(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    feature_cols: Sequence[str],
+    half_life_days: Optional[int],
+) -> PreparedMatrixBundle:
+    cfg = _runtime_cfg()
+    key = _prep_cache_key(train_df, val_df, feature_cols, half_life_days)
+    if cfg.enable_optimizations and key in _PREP_CACHE:
+        return _PREP_CACHE[key]
+    with _timed_phase("_prepare_prediction_matrices", detail="cache_miss"):
+        X_train_df, y_train = _xy(train_df, feature_cols)
+        X_val_df = val_df.reindex(columns=list(feature_cols), fill_value=0.0).astype(float)
+        sw = _compute_time_decay_weights(train_df["Date"], half_life_days)
+        bundle = PreparedMatrixBundle(
+            X_train=np.asarray(X_train_df.to_numpy(dtype=float), dtype=float),
+            y_train=np.asarray(y_train, dtype=float),
+            X_val=np.asarray(X_val_df.to_numpy(dtype=float), dtype=float),
+            sample_weight=np.asarray(sw, dtype=float),
+        )
+    if cfg.enable_optimizations:
+        _PREP_CACHE[key] = bundle
+    return bundle
+
+
 def _make_pipeline_ridge(alpha: float, seed: int) -> Pipeline:
     return Pipeline([("scaler", StandardScaler()), ("model", Ridge(alpha=float(alpha), random_state=seed))])
 
@@ -289,13 +616,17 @@ def _make_pipeline_huber(seed: int) -> Pipeline:
 
 
 def _make_histgb(params: Mapping[str, Any], seed: int, quantile: Optional[float] = None):
+    cfg = _runtime_cfg()
+    max_iter = int(params["max_iter"])
+    if cfg.fast_mode:
+        max_iter = min(max_iter, int(cfg.histgb_max_iter_cap))
     base = dict(
         learning_rate=float(params["learning_rate"]),
         max_depth=int(params["max_depth"]),
         max_leaf_nodes=int(params["max_leaf_nodes"]),
         min_samples_leaf=int(params["min_samples_leaf"]),
         l2_regularization=float(params["l2_regularization"]),
-        max_iter=int(params["max_iter"]),
+        max_iter=int(max_iter),
         early_stopping=False,
         random_state=seed,
     )
@@ -310,17 +641,128 @@ def _make_histgb(params: Mapping[str, Any], seed: int, quantile: Optional[float]
             learning_rate=float(params["learning_rate"]),
             max_depth=int(params["max_depth"]),
             min_samples_leaf=int(params["min_samples_leaf"]),
-            n_estimators=min(max(int(params["max_iter"]), 100), 500),
+            n_estimators=min(max(int(max_iter), 100), 500),
             random_state=seed,
         )
 
 
-def _fit_model(estimator, X: pd.DataFrame, y: np.ndarray, sample_weight: Optional[np.ndarray]):
+def _fit_model(estimator, X: Any, y: np.ndarray, sample_weight: Optional[np.ndarray]):
     if sample_weight is None:
         return estimator.fit(X, y)
     if isinstance(estimator, Pipeline):
         return estimator.fit(X, y, model__sample_weight=sample_weight)
     return estimator.fit(X, y, sample_weight=sample_weight)
+
+
+def _safe_constant_fallback(y_train: np.ndarray, n_out: int) -> np.ndarray:
+    y_train = np.asarray(y_train, dtype=float)
+    c = float(np.nanmean(y_train)) if y_train.size else 0.0
+    if not np.isfinite(c):
+        c = 0.0
+    return np.full(int(n_out), c, dtype=float)
+
+
+def _budget_reserve_fit_or_false(family: str, n: int = 1) -> bool:
+    b = _budget()
+    if b is None:
+        return True
+    return bool(b.try_reserve_fits(n=n, family=family))
+
+
+def _histgb_bag_seeds(seed: int, n_models: int) -> List[int]:
+    offsets = [0, 11, 23, 37, 53, 71, 89]
+    n = max(1, int(n_models))
+    return [int(seed + offsets[i]) for i in range(min(n, len(offsets)))]
+
+
+def _predict_families_bundle(
+    families: Sequence[str],
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    feature_cols: Sequence[str],
+    *,
+    ridge_alpha: float,
+    histgb_params: Mapping[str, Any],
+    half_life_days: Optional[int],
+    seed: int,
+) -> Dict[str, np.ndarray]:
+    with _timed_phase("_predict_family_bundle", detail="|".join(map(str, families))):
+        prep = _prepare_prediction_matrices(train_df, val_df, feature_cols, half_life_days)
+        X_train = prep.X_train
+        y_train = prep.y_train
+        X_val = prep.X_val
+        sw = prep.sample_weight
+        out: Dict[str, np.ndarray] = {}
+        cfg = _runtime_cfg()
+        b = _budget()
+        fits_remaining = b.remaining_fits() if b is not None else 10**9
+        fam_seed_offsets = {
+            "ridge": 0,
+            "huber": 10,
+            "histgb": 20,
+            "histgb_bag": 30,
+            "histgb_q50": 40,
+            "histgb_q20": 50,
+            "histgb_q80": 60,
+        }
+
+        def fit_and_predict(one_family: str, est) -> np.ndarray:
+            if not _budget_reserve_fit_or_false(one_family, 1):
+                return _safe_constant_fallback(y_train, len(X_val))
+            _record_model_fit_count(one_family)
+            _fit_model(est, X_train, y_train, sw)
+            return np.asarray(est.predict(X_val), dtype=float)
+
+        for family in families:
+            if family in out:
+                continue
+            with _timed_phase("_predict_family", detail=family):
+                if _budget_total_exceeded() and len(out) > 0:
+                    out[family] = _safe_constant_fallback(y_train, len(X_val))
+                    continue
+                fam_seed = int(seed + int(fam_seed_offsets.get(family, 0)))
+                if family == "ridge":
+                    out[family] = fit_and_predict(family, _make_pipeline_ridge(ridge_alpha, fam_seed))
+                    continue
+                if family == "huber":
+                    out[family] = fit_and_predict(family, _make_pipeline_huber(fam_seed))
+                    continue
+                if family == "histgb":
+                    out[family] = fit_and_predict(family, _make_histgb(histgb_params, fam_seed, None))
+                    continue
+                if family == "histgb_q50":
+                    out[family] = fit_and_predict(family, _make_histgb(histgb_params, fam_seed, 0.5))
+                    continue
+                if family == "histgb_q20":
+                    out[family] = fit_and_predict(family, _make_histgb(histgb_params, fam_seed, 0.2))
+                    continue
+                if family == "histgb_q80":
+                    out[family] = fit_and_predict(family, _make_histgb(histgb_params, fam_seed, 0.8))
+                    continue
+                if family == "histgb_bag":
+                    bag_n = int(cfg.histgb_bag_n_models)
+                    if cfg.fast_mode:
+                        bag_n = 1
+                    if fits_remaining <= 1 or (b is not None and b.remaining_fits() <= 1):
+                        bag_n = 1
+                        if b is not None:
+                            b.note("histgb_bag_auto_reduce", "Reduced HistGB bagging to 1 model due tight fit budget.")
+                    seeds = _histgb_bag_seeds(fam_seed, bag_n)
+                    preds = []
+                    for s in seeds:
+                        if not _budget_reserve_fit_or_false(family, 1):
+                            break
+                        _record_model_fit_count(family)
+                        est = _make_histgb(histgb_params, int(s), None)
+                        _fit_model(est, X_train, y_train, sw)
+                        preds.append(np.asarray(est.predict(X_val), dtype=float))
+                    if not preds:
+                        out[family] = _safe_constant_fallback(y_train, len(X_val))
+                    else:
+                        out[family] = np.mean(np.column_stack(preds), axis=1)
+                    continue
+                raise ValueError(family)
+        return out
 
 
 def _predict_family(
@@ -334,41 +776,16 @@ def _predict_family(
     half_life_days: Optional[int],
     seed: int,
 ) -> np.ndarray:
-    X_train, y_train = _xy(train_df, feature_cols)
-    X_val, _ = _xy(val_df, feature_cols)
-    sw = _compute_time_decay_weights(train_df["Date"], half_life_days)
-    if family == "ridge":
-        est = _make_pipeline_ridge(ridge_alpha, seed)
-        _fit_model(est, X_train, y_train, sw)
-        return np.asarray(est.predict(X_val), dtype=float)
-    if family == "huber":
-        est = _make_pipeline_huber(seed)
-        _fit_model(est, X_train, y_train, sw)
-        return np.asarray(est.predict(X_val), dtype=float)
-    if family == "histgb":
-        est = _make_histgb(histgb_params, seed, None)
-        _fit_model(est, X_train, y_train, sw)
-        return np.asarray(est.predict(X_val), dtype=float)
-    if family == "histgb_q50":
-        est = _make_histgb(histgb_params, seed, 0.5)
-        _fit_model(est, X_train, y_train, sw)
-        return np.asarray(est.predict(X_val), dtype=float)
-    if family == "histgb_q20":
-        est = _make_histgb(histgb_params, seed, 0.2)
-        _fit_model(est, X_train, y_train, sw)
-        return np.asarray(est.predict(X_val), dtype=float)
-    if family == "histgb_q80":
-        est = _make_histgb(histgb_params, seed, 0.8)
-        _fit_model(est, X_train, y_train, sw)
-        return np.asarray(est.predict(X_val), dtype=float)
-    if family == "histgb_bag":
-        preds = []
-        for s in [seed, seed + 11, seed + 23, seed + 37, seed + 53]:
-            est = _make_histgb(histgb_params, int(s), None)
-            _fit_model(est, X_train, y_train, sw)
-            preds.append(np.asarray(est.predict(X_val), dtype=float))
-        return np.mean(np.column_stack(preds), axis=1)
-    raise ValueError(family)
+    return _predict_families_bundle(
+        [family],
+        train_df,
+        val_df,
+        feature_cols,
+        ridge_alpha=ridge_alpha,
+        histgb_params=histgb_params,
+        half_life_days=half_life_days,
+        seed=seed,
+    )[family]
 
 
 def _resolve_input_paths(root: Path) -> Dict[str, Path]:
@@ -426,18 +843,36 @@ def _build_split_tables(
     team_ids: Sequence[int],
     conf_values: Sequence[str],
 ) -> tuple[pd.DataFrame, pd.DataFrame, Any]:
-    static_models = fit_static_models_for_fold(train_df, team_ids=team_ids, conf_values=conf_values)
-    train_static = apply_static_models_to_train_like_rows(train_df, static_models, neutral_site=False)
-    val_static = apply_static_models_to_train_like_rows(val_df, static_models, neutral_site=False)
-    train_tbl = assemble_model_table(train_df, seq_train, train_static)
-    val_tbl = assemble_model_table(val_df, seq_val, val_static)
-    train_tbl.index = train_df.index
-    val_tbl.index = val_df.index
-    if "Date" in train_tbl.columns:
-        train_tbl["Date"] = pd.to_datetime(train_tbl["Date"])
-    if "Date" in val_tbl.columns:
-        val_tbl["Date"] = pd.to_datetime(val_tbl["Date"])
-    return train_tbl, val_tbl, static_models
+    with _timed_phase("_build_split_tables"):
+        cfg = _runtime_cfg()
+        variant_key = str(seq_train.attrs.get("_variant_name", "unknown"))
+        cache_key = (
+            variant_key,
+            _index_signature(train_df.index),
+            _index_signature(val_df.index),
+            _index_signature(seq_train.index),
+            _index_signature(seq_val.index),
+            int(len(team_ids)),
+            int(len(conf_values)),
+        )
+        if cfg.enable_optimizations and cache_key in _BUILD_SPLIT_TABLES_CACHE:
+            return _BUILD_SPLIT_TABLES_CACHE[cache_key]
+
+        static_models = fit_static_models_for_fold(train_df, team_ids=team_ids, conf_values=conf_values)
+        train_static = apply_static_models_to_train_like_rows(train_df, static_models, neutral_site=False)
+        val_static = apply_static_models_to_train_like_rows(val_df, static_models, neutral_site=False)
+        train_tbl = assemble_model_table(train_df, seq_train, train_static)
+        val_tbl = assemble_model_table(val_df, seq_val, val_static)
+        train_tbl.index = train_df.index
+        val_tbl.index = val_df.index
+        if "Date" in train_tbl.columns:
+            train_tbl["Date"] = pd.to_datetime(train_tbl["Date"])
+        if "Date" in val_tbl.columns:
+            val_tbl["Date"] = pd.to_datetime(val_tbl["Date"])
+        out = (train_tbl, val_tbl, static_models)
+        if cfg.enable_optimizations:
+            _BUILD_SPLIT_TABLES_CACHE[cache_key] = out
+        return out
 
 
 def _prepare_variant_outer_data(
@@ -448,99 +883,170 @@ def _prepare_variant_outer_data(
     *,
     team_ids: Sequence[int],
     conf_values: Sequence[str],
+    variant_name: Optional[str] = None,
 ) -> dict:
-    outer_train_idx = np.asarray(outer_fold["train_idx"], dtype=int)
-    outer_val_idx = np.asarray(outer_fold["val_idx"], dtype=int)
-    outer_train_games = train_df.loc[outer_train_idx].copy()
-    outer_val_games = train_df.loc[outer_val_idx].copy()
-    seq_outer_train = seq_variant_full.loc[outer_train_idx].copy()
-    seq_outer_val = seq_variant_full.loc[outer_val_idx].copy()
-
-    outer_train_tbl, outer_val_tbl, static_models_outer = _build_split_tables(
-        outer_train_games,
-        outer_val_games,
-        seq_train=seq_outer_train,
-        seq_val=seq_outer_val,
-        team_ids=team_ids,
-        conf_values=conf_values,
-    )
-    outer_train_nl = _add_nonlinear_features(outer_train_tbl)
-    outer_val_nl = _add_nonlinear_features(outer_val_tbl)
-    all_cols = _select_feature_columns(outer_train_nl)
-    feature_cols_by_profile = {
-        "no_extra_recency": _feature_profile_columns(all_cols, "no_extra_recency"),
-        "compact_recency": _feature_profile_columns(all_cols, "compact_recency"),
-        "full_recency": _feature_profile_columns(all_cols, "full_recency"),
-    }
-
-    inner_splits = []
-    for inner in inner_folds:
-        tr_idx_local = np.asarray(inner["train_idx"], dtype=int)
-        va_idx_local = np.asarray(inner["val_idx"], dtype=int)
-        tr_games = outer_train_games.iloc[tr_idx_local].copy()
-        va_games = outer_train_games.iloc[va_idx_local].copy()
-        tr_seq = seq_outer_train.iloc[tr_idx_local].copy()
-        va_seq = seq_outer_train.iloc[va_idx_local].copy()
-        tr_tbl, va_tbl, _ = _build_split_tables(
-            tr_games, va_games, seq_train=tr_seq, seq_val=va_seq, team_ids=team_ids, conf_values=conf_values
+    with _timed_phase("_prepare_variant_outer_data"):
+        cfg = _runtime_cfg()
+        outer_cache_key = (
+            str(variant_name or seq_variant_full.attrs.get("_variant_name", "unknown")),
+            int(outer_fold.get("fold", -1)),
+            _index_signature(pd.Index(np.asarray(outer_fold["train_idx"], dtype=int))),
+            _index_signature(pd.Index(np.asarray(outer_fold["val_idx"], dtype=int))),
+            tuple(
+                (
+                    int(inner.get("fold", -1)),
+                    _index_signature(pd.Index(np.asarray(inner["train_idx"], dtype=int))),
+                    _index_signature(pd.Index(np.asarray(inner["val_idx"], dtype=int))),
+                )
+                for inner in inner_folds
+            ),
         )
-        inner_splits.append(
-            {
-                "fold": int(inner["fold"]),
-                "train_tbl": tr_tbl,
-                "val_tbl": va_tbl,
-                "train_nl": _add_nonlinear_features(tr_tbl),
-                "val_nl": _add_nonlinear_features(va_tbl),
+        if cfg.enable_optimizations and outer_cache_key in _PREPARE_VARIANT_CACHE:
+            return _PREPARE_VARIANT_CACHE[outer_cache_key]
+        outer_train_idx = np.asarray(outer_fold["train_idx"], dtype=int)
+        outer_val_idx = np.asarray(outer_fold["val_idx"], dtype=int)
+        outer_train_games = train_df.loc[outer_train_idx]
+        outer_val_games = train_df.loc[outer_val_idx]
+        seq_outer_train = seq_variant_full.loc[outer_train_idx]
+        seq_outer_val = seq_variant_full.loc[outer_val_idx]
+        seq_outer_train.attrs["_variant_name"] = str(variant_name or seq_variant_full.attrs.get("_variant_name", "unknown"))
+        seq_outer_val.attrs["_variant_name"] = str(variant_name or seq_variant_full.attrs.get("_variant_name", "unknown"))
+
+        outer_train_tbl, outer_val_tbl, static_models_outer = _build_split_tables(
+            outer_train_games,
+            outer_val_games,
+            seq_train=seq_outer_train,
+            seq_val=seq_outer_val,
+            team_ids=team_ids,
+            conf_values=conf_values,
+        )
+        outer_train_nl = _add_nonlinear_features(outer_train_tbl)
+        outer_val_nl = _add_nonlinear_features(outer_val_tbl)
+        all_cols = _select_feature_columns(outer_train_nl)
+        feature_cols_by_profile = {
+            "no_extra_recency": _feature_profile_columns(all_cols, "no_extra_recency"),
+            "compact_recency": _feature_profile_columns(all_cols, "compact_recency"),
+            "full_recency": _feature_profile_columns(all_cols, "full_recency"),
+        }
+
+        inner_splits = []
+        for inner in inner_folds:
+            if _budget_total_exceeded() and inner_splits:
+                break
+            tr_idx_local = np.asarray(inner["train_idx"], dtype=int)
+            va_idx_local = np.asarray(inner["val_idx"], dtype=int)
+            tr_games = outer_train_games.iloc[tr_idx_local]
+            va_games = outer_train_games.iloc[va_idx_local]
+            tr_seq = seq_outer_train.iloc[tr_idx_local]
+            va_seq = seq_outer_train.iloc[va_idx_local]
+            tr_seq.attrs["_variant_name"] = str(variant_name or seq_variant_full.attrs.get("_variant_name", "unknown"))
+            va_seq.attrs["_variant_name"] = str(variant_name or seq_variant_full.attrs.get("_variant_name", "unknown"))
+            tr_tbl, va_tbl, _ = _build_split_tables(
+                tr_games, va_games, seq_train=tr_seq, seq_val=va_seq, team_ids=team_ids, conf_values=conf_values
+            )
+            inner_splits.append(
+                {
+                    "fold": int(inner["fold"]),
+                    "train_tbl": tr_tbl,
+                    "val_tbl": va_tbl,
+                    "train_nl": _add_nonlinear_features(tr_tbl),
+                    "val_nl": _add_nonlinear_features(va_tbl),
+                }
+            )
+
+        out = {
+            "outer_train_games": outer_train_games,
+            "outer_val_games": outer_val_games,
+            "outer_train_tbl": outer_train_tbl,
+            "outer_val_tbl": outer_val_tbl,
+            "outer_train_nl": outer_train_nl,
+            "outer_val_nl": outer_val_nl,
+            "feature_cols_by_profile": feature_cols_by_profile,
+            "inner_splits": inner_splits,
+            "outer_static_models": static_models_outer,
+        }
+        if cfg.enable_optimizations:
+            _PREPARE_VARIANT_CACHE[outer_cache_key] = out
+        return out
+
+
+def _core_scan_score(
+    candidate: CoreCandidate,
+    variant_data: Mapping[str, Any],
+    histgb_grid: Sequence[Mapping[str, Any]],
+    seed: int,
+    *,
+    split_limit: Optional[int] = None,
+) -> dict:
+    with _timed_phase("_core_scan_score"):
+        feature_cols = variant_data["feature_cols_by_profile"][candidate.feature_profile]
+        histgb_params = histgb_grid[int(candidate.histgb_idx)]
+        rows = []
+        for i_split, split in enumerate(variant_data["inner_splits"]):
+            if split_limit is not None and i_split >= int(split_limit):
+                break
+            if _budget_total_exceeded() and rows:
+                break
+            tr = split["train_nl"]
+            va = split["val_nl"]
+            y = va["HomeWinMargin"].to_numpy(dtype=float)
+            if _runtime_cfg().enable_optimizations:
+                preds = _predict_families_bundle(
+                    ["ridge", "histgb"],
+                    tr,
+                    va,
+                    feature_cols,
+                    ridge_alpha=candidate.ridge_alpha,
+                    histgb_params=histgb_params,
+                    half_life_days=candidate.half_life_days,
+                    seed=seed + 1,
+                )
+                pr = preds["ridge"]
+                ph = preds["histgb"]
+            else:
+                pr = _predict_family("ridge", tr, va, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 1)
+                ph = _predict_family("histgb", tr, va, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 2)
+            mr = _reg_metrics(y, pr)
+            mh = _reg_metrics(y, ph)
+            rows.append({"fold": int(split["fold"]), "ridge_rmse": mr["rmse"], "histgb_rmse": mh["rmse"], "ridge_mae": mr["mae"], "histgb_mae": mh["mae"], "histgb_pred_std": mh["pred_std"], "actual_std": mh["actual_std"]})
+        if not rows:
+            return {
+                "candidate_key": candidate.key(),
+                "elo_variant": candidate.elo_variant,
+                "feature_profile": candidate.feature_profile,
+                "half_life_days": np.nan if candidate.half_life_days is None else int(candidate.half_life_days),
+                "ridge_alpha": float(candidate.ridge_alpha),
+                "histgb_idx": int(candidate.histgb_idx),
+                "scan_score": float("inf"),
+                "scan_histgb_rmse": float("inf"),
+                "scan_histgb_mae": float("inf"),
+                "scan_ridge_rmse": float("inf"),
+                "scan_ridge_mae": float("inf"),
+                "scan_pred_std_gap_histgb": float("nan"),
+                "scan_splits_used": 0,
             }
+        fr = pd.DataFrame(rows)
+        score = (
+            0.55 * float(fr["histgb_rmse"].mean())
+            + 0.35 * float(fr["ridge_rmse"].mean())
+            + 0.05 * float(fr["histgb_rmse"].std(ddof=0))
+            + 0.05 * abs(float(fr["histgb_pred_std"].mean() - fr["actual_std"].mean()))
         )
-
-    return {
-        "outer_train_games": outer_train_games,
-        "outer_val_games": outer_val_games,
-        "outer_train_tbl": outer_train_tbl,
-        "outer_val_tbl": outer_val_tbl,
-        "outer_train_nl": outer_train_nl,
-        "outer_val_nl": outer_val_nl,
-        "feature_cols_by_profile": feature_cols_by_profile,
-        "inner_splits": inner_splits,
-        "outer_static_models": static_models_outer,
-    }
-
-
-def _core_scan_score(candidate: CoreCandidate, variant_data: Mapping[str, Any], histgb_grid: Sequence[Mapping[str, Any]], seed: int) -> dict:
-    feature_cols = variant_data["feature_cols_by_profile"][candidate.feature_profile]
-    histgb_params = histgb_grid[int(candidate.histgb_idx)]
-    rows = []
-    for split in variant_data["inner_splits"]:
-        tr = split["train_nl"]
-        va = split["val_nl"]
-        y = va["HomeWinMargin"].to_numpy(dtype=float)
-        pr = _predict_family("ridge", tr, va, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 1)
-        ph = _predict_family("histgb", tr, va, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 2)
-        mr = _reg_metrics(y, pr)
-        mh = _reg_metrics(y, ph)
-        rows.append({"fold": int(split["fold"]), "ridge_rmse": mr["rmse"], "histgb_rmse": mh["rmse"], "ridge_mae": mr["mae"], "histgb_mae": mh["mae"], "histgb_pred_std": mh["pred_std"], "actual_std": mh["actual_std"]})
-    fr = pd.DataFrame(rows)
-    score = (
-        0.55 * float(fr["histgb_rmse"].mean())
-        + 0.35 * float(fr["ridge_rmse"].mean())
-        + 0.05 * float(fr["histgb_rmse"].std(ddof=0))
-        + 0.05 * abs(float(fr["histgb_pred_std"].mean() - fr["actual_std"].mean()))
-    )
-    return {
-        "candidate_key": candidate.key(),
-        "elo_variant": candidate.elo_variant,
-        "feature_profile": candidate.feature_profile,
-        "half_life_days": np.nan if candidate.half_life_days is None else int(candidate.half_life_days),
-        "ridge_alpha": float(candidate.ridge_alpha),
-        "histgb_idx": int(candidate.histgb_idx),
-        "scan_score": float(score),
-        "scan_histgb_rmse": float(fr["histgb_rmse"].mean()),
-        "scan_histgb_mae": float(fr["histgb_mae"].mean()),
-        "scan_ridge_rmse": float(fr["ridge_rmse"].mean()),
-        "scan_ridge_mae": float(fr["ridge_mae"].mean()),
-        "scan_pred_std_gap_histgb": float(fr["histgb_pred_std"].mean() - fr["actual_std"].mean()),
-    }
+        return {
+            "candidate_key": candidate.key(),
+            "elo_variant": candidate.elo_variant,
+            "feature_profile": candidate.feature_profile,
+            "half_life_days": np.nan if candidate.half_life_days is None else int(candidate.half_life_days),
+            "ridge_alpha": float(candidate.ridge_alpha),
+            "histgb_idx": int(candidate.histgb_idx),
+            "scan_score": float(score),
+            "scan_histgb_rmse": float(fr["histgb_rmse"].mean()),
+            "scan_histgb_mae": float(fr["histgb_mae"].mean()),
+            "scan_ridge_rmse": float(fr["ridge_rmse"].mean()),
+            "scan_ridge_mae": float(fr["ridge_mae"].mean()),
+            "scan_pred_std_gap_histgb": float(fr["histgb_pred_std"].mean() - fr["actual_std"].mean()),
+            "scan_splits_used": int(len(fr)),
+        }
 
 
 def _scan_and_select_core_candidates(
@@ -548,20 +1054,85 @@ def _scan_and_select_core_candidates(
     histgb_grid: Sequence[Mapping[str, Any]],
     seed: int,
 ) -> tuple[List[CoreCandidate], pd.DataFrame]:
-    scan_rows = []
-    for v in outer_variant_data.keys():
-        for profile in ["no_extra_recency", "compact_recency", "full_recency"]:
-            for hl in [None, 30, 60]:
-                for ra in [4.0, 16.0]:
-                    for hidx in range(len(histgb_grid)):
-                        cand = CoreCandidate(v, profile, hl, ra, hidx)
-                        scan_rows.append(_core_scan_score(cand, outer_variant_data[v], histgb_grid, seed=seed))
-    scan_df = pd.DataFrame(scan_rows).sort_values(["scan_score", "scan_histgb_rmse", "scan_ridge_rmse"], kind="mergesort").reset_index(drop=True)
-    top_cands: List[CoreCandidate] = []
-    for _, r in scan_df.head(3).iterrows():
-        hl = None if pd.isna(r["half_life_days"]) else int(r["half_life_days"])
-        top_cands.append(CoreCandidate(str(r["elo_variant"]), str(r["feature_profile"]), hl, float(r["ridge_alpha"]), int(r["histgb_idx"])))
-    return top_cands, scan_df
+    with _timed_phase("_scan_and_select_core_candidates"):
+        cfg = _runtime_cfg()
+        scan_start_elapsed = now_seconds()
+        all_candidates: List[CoreCandidate] = []
+        for v in outer_variant_data.keys():
+            for profile in ["no_extra_recency", "compact_recency", "full_recency"]:
+                for hl in [None, 30, 60]:
+                    for ra in [4.0, 16.0]:
+                        for hidx in range(len(histgb_grid)):
+                            all_candidates.append(CoreCandidate(v, profile, hl, ra, hidx))
+
+        if not cfg.enable_optimizations:
+            coarse_keep: List[CoreCandidate] = list(all_candidates)
+            coarse_rows_df = pd.DataFrame()
+        else:
+            coarse_rows: List[dict] = []
+            for i, cand in enumerate(all_candidates):
+                if _budget_scan_exceeded(scan_start_elapsed) and coarse_rows:
+                    break
+                if _budget_total_exceeded() and coarse_rows:
+                    break
+                row = _core_scan_score(cand, outer_variant_data[cand.elo_variant], histgb_grid, seed=seed, split_limit=1)
+                row["scan_stage"] = "coarse"
+                coarse_rows.append(row)
+                if cfg.fast_mode and len(coarse_rows) >= int(cfg.fast_scan_topn):
+                    # In fast mode, still use broad generation logic but cap coarse pass count for guaranteed runtime.
+                    break
+            coarse_rows_df = pd.DataFrame(coarse_rows)
+            if coarse_rows_df.empty:
+                coarse_keep = [all_candidates[0]] if all_candidates else []
+            else:
+                n_keep = max(
+                    1,
+                    min(
+                        int(cfg.scan_prune_keep_top_n),
+                        int(math.ceil(float(cfg.scan_prune_keep_frac) * float(len(coarse_rows_df)))),
+                    ),
+                )
+                if cfg.fast_mode:
+                    n_keep = min(n_keep, int(cfg.fast_scan_topn))
+                keep_keys = set(coarse_rows_df.sort_values(["scan_score", "scan_histgb_rmse"], kind="mergesort").head(n_keep)["candidate_key"].astype(str))
+                coarse_keep = [c for c in all_candidates if c.key() in keep_keys]
+
+        scan_rows = []
+        for i, cand in enumerate(coarse_keep):
+            if _budget_scan_exceeded(scan_start_elapsed) and scan_rows:
+                break
+            if _budget_total_exceeded() and scan_rows:
+                break
+            row = _core_scan_score(cand, outer_variant_data[cand.elo_variant], histgb_grid, seed=seed)
+            row["scan_stage"] = "full"
+            scan_rows.append(row)
+            if cfg.fast_mode and len(scan_rows) >= int(cfg.fast_scan_topn):
+                break
+        if scan_rows:
+            scan_df = pd.DataFrame(scan_rows)
+        elif not coarse_rows_df.empty:
+            scan_df = coarse_rows_df.copy()
+        else:
+            # Guaranteed fallback candidate if budgets stopped everything.
+            fallback = all_candidates[0]
+            scan_df = pd.DataFrame([_core_scan_score(fallback, outer_variant_data[fallback.elo_variant], histgb_grid, seed=seed, split_limit=1)])
+        if not coarse_rows_df.empty and "scan_stage" in coarse_rows_df.columns:
+            coarse_for_log = coarse_rows_df.copy()
+            coarse_for_log["scan_stage"] = coarse_for_log.get("scan_stage", "coarse")
+            scan_df = pd.concat([scan_df, coarse_for_log], ignore_index=True).drop_duplicates(subset=["candidate_key", "scan_stage"], keep="first")
+        scan_df = scan_df.sort_values(["scan_score", "scan_histgb_rmse", "scan_ridge_rmse"], kind="mergesort").reset_index(drop=True)
+        top_cands: List[CoreCandidate] = []
+        scan_for_select = scan_df.copy()
+        if "scan_stage" in scan_for_select.columns:
+            scan_for_select = scan_for_select[scan_for_select["scan_stage"].astype(str) != "coarse"]
+        for _, r in scan_for_select.head(int(cfg.scan_top_candidates_return)).iterrows():
+            hl = None if pd.isna(r["half_life_days"]) else int(r["half_life_days"])
+            top_cands.append(CoreCandidate(str(r["elo_variant"]), str(r["feature_profile"]), hl, float(r["ridge_alpha"]), int(r["histgb_idx"])))
+        if not top_cands:
+            for _, r in scan_df.head(int(cfg.scan_top_candidates_return)).iterrows():
+                hl = None if pd.isna(r["half_life_days"]) else int(r["half_life_days"])
+                top_cands.append(CoreCandidate(str(r["elo_variant"]), str(r["feature_profile"]), hl, float(r["ridge_alpha"]), int(r["histgb_idx"])))
+        return top_cands, scan_df
 
 
 def _regime_thresholds(df: pd.DataFrame) -> dict:
@@ -798,14 +1369,65 @@ def _generate_inner_oof_and_outer_preds(
     histgb_grid: Sequence[Mapping[str, Any]],
     seed: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    histgb_params = histgb_grid[int(candidate.histgb_idx)]
-    feature_cols = variant_data["feature_cols_by_profile"][candidate.feature_profile]
-    inner_rows = []
-    for split in variant_data["inner_splits"]:
-        tr = split["train_nl"]
-        va = split["val_nl"]
-        y_val = va["HomeWinMargin"].to_numpy(dtype=float)
-        base = va[
+    with _timed_phase("_generate_inner_oof_and_outer_preds"):
+        histgb_params = histgb_grid[int(candidate.histgb_idx)]
+        feature_cols = variant_data["feature_cols_by_profile"][candidate.feature_profile]
+        cfg = _runtime_cfg()
+        inner_rows = []
+        for split in variant_data["inner_splits"]:
+            if _budget_total_exceeded() and inner_rows:
+                break
+            tr = split["train_nl"]
+            va = split["val_nl"]
+            y_val = va["HomeWinMargin"].to_numpy(dtype=float)
+            base = va[
+                [
+                    "Date",
+                    "elo_diff_pre",
+                    "massey_diff",
+                    "offdef_net_diff",
+                    "volatility_home",
+                    "volatility_away",
+                    "games_played_home",
+                    "games_played_away",
+                    "same_conf_flag",
+                    "cross_conf_flag",
+                    "trend_margin_last5_vs_season_diff",
+                    "trend_oppadj_last5_vs_season_diff",
+                    "consistency_ratio_diff",
+                ]
+            ].copy()
+            base["row_index"] = va.index.to_numpy()
+            base["fold"] = int(split["fold"])
+            base["y_true"] = y_val
+            if cfg.enable_optimizations:
+                pred_bundle = _predict_families_bundle(
+                    ["ridge", "huber", "histgb", "histgb_bag", "histgb_q50"],
+                    tr,
+                    va,
+                    feature_cols,
+                    ridge_alpha=candidate.ridge_alpha,
+                    histgb_params=histgb_params,
+                    half_life_days=candidate.half_life_days,
+                    seed=seed + 10,
+                )
+                base["pred_ridge"] = pred_bundle["ridge"]
+                base["pred_huber"] = pred_bundle["huber"]
+                base["pred_histgb"] = pred_bundle["histgb"]
+                base["pred_histgb_bag"] = pred_bundle["histgb_bag"]
+                base["pred_q50"] = pred_bundle["histgb_q50"]
+            else:
+                base["pred_ridge"] = _predict_family("ridge", tr, va, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 10)
+                base["pred_huber"] = _predict_family("huber", tr, va, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 20)
+                base["pred_histgb"] = _predict_family("histgb", tr, va, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 30)
+                base["pred_histgb_bag"] = _predict_family("histgb_bag", tr, va, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 40)
+                base["pred_q50"] = _predict_family("histgb_q50", tr, va, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 50)
+            inner_rows.append(base)
+        inner_oof = pd.concat(inner_rows, ignore_index=True) if inner_rows else pd.DataFrame()
+
+        tr_full = variant_data["outer_train_nl"]
+        va_outer = variant_data["outer_val_nl"]
+        outer_pred_df = va_outer[
             [
                 "Date",
                 "elo_diff_pre",
@@ -822,47 +1444,50 @@ def _generate_inner_oof_and_outer_preds(
                 "consistency_ratio_diff",
             ]
         ].copy()
-        base["row_index"] = va.index.to_numpy()
-        base["fold"] = int(split["fold"])
-        base["y_true"] = y_val
-        base["pred_ridge"] = _predict_family("ridge", tr, va, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 10)
-        base["pred_huber"] = _predict_family("huber", tr, va, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 20)
-        base["pred_histgb"] = _predict_family("histgb", tr, va, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 30)
-        base["pred_histgb_bag"] = _predict_family("histgb_bag", tr, va, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 40)
-        base["pred_q50"] = _predict_family("histgb_q50", tr, va, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 50)
-        inner_rows.append(base)
-    inner_oof = pd.concat(inner_rows, ignore_index=True)
-
-    tr_full = variant_data["outer_train_nl"]
-    va_outer = variant_data["outer_val_nl"]
-    outer_pred_df = va_outer[
-        [
-            "Date",
-            "elo_diff_pre",
-            "massey_diff",
-            "offdef_net_diff",
-            "volatility_home",
-            "volatility_away",
-            "games_played_home",
-            "games_played_away",
-            "same_conf_flag",
-            "cross_conf_flag",
-            "trend_margin_last5_vs_season_diff",
-            "trend_oppadj_last5_vs_season_diff",
-            "consistency_ratio_diff",
-        ]
-    ].copy()
-    outer_pred_df["row_index"] = va_outer.index.to_numpy()
-    outer_pred_df["y_true"] = va_outer["HomeWinMargin"].to_numpy(dtype=float)
-    outer_pred_df["pred_ridge"] = _predict_family("ridge", tr_full, va_outer, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 110)
-    outer_pred_df["pred_huber"] = _predict_family("huber", tr_full, va_outer, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 120)
-    outer_pred_df["pred_histgb"] = _predict_family("histgb", tr_full, va_outer, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 130)
-    outer_pred_df["pred_histgb_bag"] = _predict_family("histgb_bag", tr_full, va_outer, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 140)
-    outer_pred_df["pred_q50"] = _predict_family("histgb_q50", tr_full, va_outer, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 150)
-    return inner_oof, outer_pred_df
+        outer_pred_df["row_index"] = va_outer.index.to_numpy()
+        outer_pred_df["y_true"] = va_outer["HomeWinMargin"].to_numpy(dtype=float)
+        if cfg.enable_optimizations:
+            outer_bundle = _predict_families_bundle(
+                ["ridge", "huber", "histgb", "histgb_bag", "histgb_q50"],
+                tr_full,
+                va_outer,
+                feature_cols,
+                ridge_alpha=candidate.ridge_alpha,
+                histgb_params=histgb_params,
+                half_life_days=candidate.half_life_days,
+                seed=seed + 110,
+            )
+            outer_pred_df["pred_ridge"] = outer_bundle["ridge"]
+            outer_pred_df["pred_huber"] = outer_bundle["huber"]
+            outer_pred_df["pred_histgb"] = outer_bundle["histgb"]
+            outer_pred_df["pred_histgb_bag"] = outer_bundle["histgb_bag"]
+            outer_pred_df["pred_q50"] = outer_bundle["histgb_q50"]
+        else:
+            outer_pred_df["pred_ridge"] = _predict_family("ridge", tr_full, va_outer, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 110)
+            outer_pred_df["pred_huber"] = _predict_family("huber", tr_full, va_outer, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 120)
+            outer_pred_df["pred_histgb"] = _predict_family("histgb", tr_full, va_outer, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 130)
+            outer_pred_df["pred_histgb_bag"] = _predict_family("histgb_bag", tr_full, va_outer, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 140)
+            outer_pred_df["pred_q50"] = _predict_family("histgb_q50", tr_full, va_outer, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 150)
+        return inner_oof, outer_pred_df
 
 
 def _evaluate_postprocess_progressive(inner_oof: pd.DataFrame, cand: PostprocessCandidate) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
+    if inner_oof is None or inner_oof.empty:
+        empty_metrics = {
+            "candidate_key": cand.key(),
+            "rmse_final": float("inf"),
+            "mae_final": float("inf"),
+            "bias_final": 0.0,
+            "rmse_mean_stack": float("inf"),
+            "rmse_q50": float("inf"),
+            "rmse_blend_raw": float("inf"),
+            "rmse_calibrated": float("inf"),
+            "rmse_scaled": float("inf"),
+            "pred_std_final": 0.0,
+            "actual_std": 0.0,
+            "dispersion_ratio": 1.0,
+        }
+        return empty_metrics, pd.DataFrame(), pd.DataFrame(columns=["row_index", "fold", "y_true", "pred_q50", "pred_raw_mean", "pred_raw_blend", "pred_calibrated", "pred_scaled", "pred_final"])
     df = inner_oof.sort_values(["fold", "row_index"], kind="mergesort").reset_index(drop=True)
     final_pred = np.zeros(len(df), dtype=float)
     raw_mean_all = np.zeros(len(df), dtype=float)
@@ -942,11 +1567,21 @@ def _select_postprocess(inner_oof: pd.DataFrame, post_grid: Sequence[Postprocess
     metric_rows = []
     fold_rows = []
     pred_map: Dict[str, pd.DataFrame] = {}
-    for cand in post_grid:
+    for i, cand in enumerate(post_grid):
+        if _budget_total_exceeded() and metric_rows:
+            break
         m, f, p = _evaluate_postprocess_progressive(inner_oof, cand)
         metric_rows.append(m)
         fold_rows.append(f)
         pred_map[cand.key()] = p
+        if _runtime_cfg().fast_mode and i + 1 >= int(_runtime_cfg().fast_post_grid_limit):
+            break
+    if not metric_rows:
+        fallback = post_grid[0]
+        m, f, p = _evaluate_postprocess_progressive(inner_oof, fallback)
+        metric_rows.append(m)
+        fold_rows.append(f)
+        pred_map[fallback.key()] = p
     metric_df = pd.DataFrame(metric_rows)
     metric_df["selection_score"] = (
         metric_df["rmse_final"]
@@ -957,7 +1592,7 @@ def _select_postprocess(inner_oof: pd.DataFrame, post_grid: Sequence[Postprocess
     metric_df = metric_df.sort_values(["selection_score", "rmse_final", "mae_final"], kind="mergesort").reset_index(drop=True)
     best_key = str(metric_df.iloc[0]["candidate_key"])
     best_cand = next(c for c in post_grid if c.key() == best_key)
-    fold_diag = pd.concat(fold_rows, ignore_index=True)
+    fold_diag = pd.concat(fold_rows, ignore_index=True) if fold_rows else pd.DataFrame()
     return best_cand, metric_df, fold_diag, pred_map[best_key].copy()
 
 
@@ -985,6 +1620,8 @@ def _zscore_series(s: pd.Series) -> pd.Series:
 
 def _compute_ranking_weights_from_oof(component_oof: pd.DataFrame) -> Dict[str, float]:
     cols = ["elo_diff_pre", "massey_diff", "offdef_net_diff", "recent_form_diff"]
+    if component_oof is None or component_oof.empty or len(component_oof) < 10:
+        return {"elo": 0.25, "massey": 0.25, "net": 0.25, "recent": 0.25}
     X = component_oof[cols].astype(float)
     y = component_oof["HomeWinMargin"].astype(float).to_numpy()
     model = Pipeline([("scaler", StandardScaler()), ("ridge", Ridge(alpha=4.0, random_state=SEED_DEFAULT))])
@@ -1156,6 +1793,159 @@ def _page_with_table(pdf: PdfPages, title: str, df: pd.DataFrame, max_rows_per_p
         plt.close(fig)
 
 
+def _timing_phase_table(summary: Mapping[str, Any], focus_phases: Sequence[str]) -> pd.DataFrame:
+    pt = dict(summary.get("phase_totals_sec", {}) or {})
+    pc = dict(summary.get("phase_counts", {}) or {})
+    rows = []
+    for p in focus_phases:
+        rows.append({"phase": p, "total_sec": float(pt.get(p, 0.0)), "calls": int(pc.get(p, 0))})
+    return pd.DataFrame(rows).sort_values("total_sec", ascending=False, kind="mergesort").reset_index(drop=True)
+
+
+def _timing_family_table(summary: Mapping[str, Any]) -> pd.DataFrame:
+    pf = dict(summary.get("predict_family_totals_sec", {}) or {})
+    pfc = dict(summary.get("predict_family_call_counts", {}) or {})
+    fitc = dict(summary.get("model_fit_counts_by_family", {}) or {})
+    fams = sorted(set(pf.keys()) | set(pfc.keys()) | set(fitc.keys()))
+    rows = []
+    for fam in fams:
+        rows.append(
+            {
+                "family": fam,
+                "predict_time_sec": float(pf.get(fam, 0.0)),
+                "predict_calls": int(pfc.get(fam, 0)),
+                "fit_count": int(fitc.get(fam, 0)),
+            }
+        )
+    return pd.DataFrame(rows).sort_values(["predict_time_sec", "fit_count"], ascending=[False, False], kind="mergesort").reset_index(drop=True)
+
+
+def _load_json_if_exists(path: Path) -> Optional[dict]:
+    try:
+        if path.exists():
+            with path.open("r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        return None
+    return None
+
+
+def _timing_compare_table(before_summary: Optional[Mapping[str, Any]], after_summary: Mapping[str, Any], focus_phases: Sequence[str]) -> pd.DataFrame:
+    before_pt = dict((before_summary or {}).get("phase_totals_sec", {}) or {})
+    before_fit = dict((before_summary or {}).get("model_fit_counts_by_family", {}) or {})
+    after_pt = dict(after_summary.get("phase_totals_sec", {}) or {})
+    after_fit = dict(after_summary.get("model_fit_counts_by_family", {}) or {})
+    rows = []
+    for p in focus_phases:
+        b = float(before_pt.get(p, np.nan)) if before_summary is not None else np.nan
+        a = float(after_pt.get(p, np.nan))
+        rows.append({"kind": "phase", "name": p, "before_sec": b, "after_sec": a, "delta_sec": a - b if np.isfinite(b) and np.isfinite(a) else np.nan})
+    for fam in sorted(set(before_fit.keys()) | set(after_fit.keys())):
+        b = float(before_fit.get(fam, np.nan)) if before_summary is not None else np.nan
+        a = float(after_fit.get(fam, np.nan))
+        rows.append({"kind": "fit_count", "name": fam, "before_sec": b, "after_sec": a, "delta_sec": a - b if np.isfinite(b) and np.isfinite(a) else np.nan})
+    return pd.DataFrame(rows)
+
+
+def _write_run_report(
+    path: Path,
+    *,
+    root: Path,
+    inputs_used: Mapping[str, Path],
+    runtime_cfg: RuntimeConfig,
+    budget: Optional[BudgetController],
+    timing_summary: Mapping[str, Any],
+    selected_summary: Mapping[str, Any],
+    outer_rmse: float,
+    outer_mae: float,
+    predictions_out: pd.DataFrame,
+    rankings_out: pd.DataFrame,
+) -> None:
+    focus_phases = [
+        "_scan_and_select_core_candidates",
+        "_core_scan_score",
+        "_generate_inner_oof_and_outer_preds",
+        "_predict_family",
+        "_build_split_tables",
+        "_prepare_variant_outer_data",
+    ]
+    fast_before = _load_json_if_exists(root / "timing_summary_fast_baseline.json")
+    fast_after = _load_json_if_exists(root / "timing_summary_fast.json")
+    lines: List[str] = []
+    lines.append("# AlgoSports23 Run Report")
+    lines.append("")
+    lines.append(f"- Timestamp (UTC): {pd.Timestamp.utcnow().isoformat()}")
+    lines.append(f"- Working directory: `{root}`")
+    lines.append(f"- Thread limits: `OMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS', '')}`, `MKL_NUM_THREADS={os.environ.get('MKL_NUM_THREADS', '')}`")
+    lines.append(f"- Runtime config: fast_mode={int(runtime_cfg.fast_mode)}, max_total={runtime_cfg.max_total_seconds}s, max_scan={runtime_cfg.max_scan_seconds}s, max_fits={runtime_cfg.max_fits}, bag_n={runtime_cfg.histgb_bag_n_models}, optimizations={int(runtime_cfg.enable_optimizations)}")
+    lines.append("")
+    lines.append("## Files Used / Found")
+    for k, p in inputs_used.items():
+        lines.append(f"- {k}: `{p}` (exists={p.exists()})")
+    lines.append("")
+    lines.append("## Fast Profile Findings")
+    if fast_after is None:
+        lines.append("- `timing_summary_fast.json` not found in this run session.")
+    else:
+        lines.append("- Fast profile timing summary loaded from `timing_summary_fast.json`.")
+        if fast_before is not None:
+            lines.append("- Baseline fast profile timing summary loaded from `timing_summary_fast_baseline.json`.")
+            cmp_df = _timing_compare_table(fast_before, fast_after, focus_phases)
+            lines.append("")
+            lines.append("### Fast Profile Before vs After (selected phases / fit counts)")
+            lines.append("")
+            lines.append("```text")
+            lines.append(_format_df_for_text(cmp_df, max_rows=40, width=160))
+            lines.append("```")
+        else:
+            lines.append("- Baseline fast profile file not found; reporting optimized fast summary only.")
+        lines.append("")
+        lines.append("### Optimized Fast Timing (focus phases)")
+        lines.append("")
+        lines.append("```text")
+        lines.extend(_timing_summary_lines(fast_after, focus_phases=focus_phases, top_n=10))
+        lines.append("```")
+    lines.append("")
+    lines.append("## Final Run Timing Summary")
+    lines.append("")
+    lines.append("```text")
+    lines.extend(_timing_summary_lines(timing_summary, focus_phases=focus_phases, top_n=10))
+    lines.append("```")
+    lines.append("")
+    lines.append("## Budgets / Safety Controls")
+    if budget is None:
+        lines.append("- No active budget controller recorded.")
+    else:
+        lines.append(f"- Elapsed wall time (pipeline): {budget.elapsed():.2f}s")
+        lines.append(f"- Fit count used: {budget.fit_count}")
+        lines.append(f"- Budgets triggered: {', '.join(sorted(budget.triggered.keys())) if budget.triggered else 'none'}")
+        if budget.events:
+            lines.append("- Budget events:")
+            for msg in budget.events[:20]:
+                lines.append(f"  - {msg}")
+    lines.append("")
+    lines.append("## Chosen Model / CV Metrics")
+    lines.append(f"- Selected model family: {selected_summary.get('model_family')}")
+    lines.append(f"- Selected Elo variant: {selected_summary.get('elo_variant')}")
+    lines.append(f"- Feature profile / half-life: {selected_summary.get('feature_profile')} / {selected_summary.get('half_life_days')}")
+    lines.append(f"- Calibration / scale / regime stack: {selected_summary.get('calibration_mode')} / {selected_summary.get('scale_mode')} / {selected_summary.get('use_regime_stack')}")
+    lines.append(f"- Nested outer RMSE / MAE: {outer_rmse:.5f} / {outer_mae:.5f}")
+    lines.append("")
+    lines.append("## Sanity Checks")
+    pred_num = pd.to_numeric(predictions_out.get('Team1_WinMargin'), errors='coerce') if "Team1_WinMargin" in predictions_out.columns else pd.Series(dtype=float)
+    lines.append(f"- predictions.csv rows={len(predictions_out)}; Team1_WinMargin numeric+nonmissing={bool(len(pred_num)==len(predictions_out) and pred_num.notna().all())}")
+    rank_vals = pd.to_numeric(rankings_out.get('Rank'), errors='coerce') if "Rank" in rankings_out.columns else pd.Series(dtype=float)
+    rank_ok = bool(len(rankings_out) == 165 and len(rank_vals) == len(rankings_out) and rank_vals.notna().all() and set(rank_vals.astype(int).tolist()) == set(range(1, 166)))
+    lines.append(f"- rankings.xlsx rows={len(rankings_out)}; Rank exactly 1..165={rank_ok}")
+    lines.append("")
+    lines.append("## Output File Paths")
+    for out_name in ["predictions.csv", "rankings.xlsx", "final_report.pdf", "run_report.md"]:
+        p = root / out_name
+        size = p.stat().st_size if p.exists() else -1
+        lines.append(f"- `{p}` (exists={p.exists()}, bytes={size})")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def _build_report(
     out_path: Path,
     *,
@@ -1183,6 +1973,10 @@ def _build_report(
     prediction_head: pd.DataFrame,
     selected_summary: Mapping[str, Any],
     selected_hparams_table: pd.DataFrame,
+    runtime_notes: Optional[List[str]] = None,
+    runtime_phase_table: Optional[pd.DataFrame] = None,
+    runtime_family_table: Optional[pd.DataFrame] = None,
+    runtime_compare_table: Optional[pd.DataFrame] = None,
 ) -> None:
     with PdfPages(out_path) as pdf:
         outer_rmse = float(outer_fold_metrics["rmse"].mean()) if not outer_fold_metrics.empty else float("nan")
@@ -1198,8 +1992,17 @@ def _build_report(
                 f"- Selected Elo variant: {selected_summary.get('elo_variant')}",
                 f"- Nested outer RMSE/MAE: {outer_rmse:.3f} / {outer_mae:.3f}",
                 f"- Calibration={selected_summary.get('calibration_mode')} | Scale={selected_summary.get('scale_mode')} | Regime stack={selected_summary.get('use_regime_stack')}",
+                f"- Runtime safety: fast_mode={selected_summary.get('fast_mode')} | budget_triggered={selected_summary.get('budget_triggered')}",
             ],
         )
+        if runtime_notes:
+            _new_text_page(pdf, "1B. Runtime Bottleneck And Fixes", ["Runtime bottleneck and fixes"] + [f"- {x}" for x in runtime_notes])
+        if runtime_compare_table is not None and not runtime_compare_table.empty:
+            _page_with_table(pdf, "1C. Fast Profiling Before vs After (timing / fits)", runtime_compare_table, max_rows_per_page=24)
+        if runtime_phase_table is not None and not runtime_phase_table.empty:
+            _page_with_table(pdf, "1D. Runtime Focus Phase Timing Summary", runtime_phase_table, max_rows_per_page=24)
+        if runtime_family_table is not None and not runtime_family_table.empty:
+            _page_with_table(pdf, "1E. _predict_family Aggregated Timing / Fit Counts", runtime_family_table, max_rows_per_page=24)
 
         lines = [
             "2. What changed vs previous pipeline",
@@ -1244,6 +2047,8 @@ def _build_report(
             _page_with_table(pdf, f"9. Scale params ({name})", tbl, max_rows_per_page=24)
 
         oof = outer_pred_oof.copy()
+        if oof.empty:
+            oof = pd.DataFrame({"y_true": np.array([0.0]), "pred_final": np.array([0.0]), "pred_raw_mean": np.array([0.0]), "pred_q50": np.array([0.0]), "pred_raw_blend": np.array([0.0]), "pred_calibrated": np.array([0.0]), "elo_diff_pre": np.array([0.0])})
         y = oof["y_true"].to_numpy(dtype=float)
         p = oof["pred_final"].to_numpy(dtype=float)
         resid = y - p
@@ -1375,33 +2180,64 @@ def _prepare_full_derby_predictions(
         ]
     ].copy()
     derby_pred_df["row_index"] = derby_nl.index.to_numpy()
-    for fam, col, sdelta in [
+    family_spec = [
         ("ridge", "pred_ridge", 10),
         ("huber", "pred_huber", 20),
         ("histgb", "pred_histgb", 30),
         ("histgb_bag", "pred_histgb_bag", 40),
         ("histgb_q50", "pred_q50", 50),
-        ("histgb_q20", "pred_q20", 60),
-        ("histgb_q80", "pred_q80", 70),
-    ]:
-        derby_pred_df[col] = _predict_family(
-            fam,
+    ]
+    cfg = _runtime_cfg()
+    if not (cfg.fast_mode and cfg.fast_disable_q20_q80):
+        family_spec.extend([("histgb_q20", "pred_q20", 60), ("histgb_q80", "pred_q80", 70)])
+    if cfg.enable_optimizations:
+        fams = [fam for fam, _, _ in family_spec]
+        preds = _predict_families_bundle(
+            fams,
             train_nl,
             derby_nl,
             feature_cols,
             ridge_alpha=core_candidate.ridge_alpha,
             histgb_params=histgb_params,
             half_life_days=core_candidate.half_life_days,
-            seed=seed + sdelta,
+            seed=seed + 10,
         )
+        for fam, col, _ in family_spec:
+            derby_pred_df[col] = preds[fam]
+    else:
+        for fam, col, sdelta in family_spec:
+            derby_pred_df[col] = _predict_family(
+                fam,
+                train_nl,
+                derby_nl,
+                feature_cols,
+                ridge_alpha=core_candidate.ridge_alpha,
+                histgb_params=histgb_params,
+                half_life_days=core_candidate.half_life_days,
+                seed=seed + sdelta,
+            )
     return train_nl, derby_nl, static_models_full, {"derby_pred_df": derby_pred_df}
 
 
 def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
+    global _ACTIVE_PROFILER, _ACTIVE_RUNTIME_CFG, _ACTIVE_BUDGET, _PIPELINE_START_PERF
     warnings.filterwarnings("ignore", category=FutureWarning)
     warnings.filterwarnings("ignore", category=UserWarning)
     warnings.filterwarnings("ignore", category=RuntimeWarning)
     _set_deterministic(seed)
+    runtime_cfg = _load_runtime_config_from_env()
+    prev_profiler = _ACTIVE_PROFILER
+    prev_runtime_cfg = _ACTIVE_RUNTIME_CFG
+    prev_budget = _ACTIVE_BUDGET
+    prev_pipeline_start = _PIPELINE_START_PERF
+    _ACTIVE_PROFILER = RuntimeProfiler()
+    _ACTIVE_RUNTIME_CFG = runtime_cfg
+    _ACTIVE_BUDGET = BudgetController(cfg=runtime_cfg)
+    _PIPELINE_START_PERF = time.perf_counter()
+    _PREP_CACHE.clear()
+    _BUILD_SPLIT_TABLES_CACHE.clear()
+    _PREPARE_VARIANT_CACHE.clear()
+    pipeline_t0 = time.perf_counter()
 
     paths = _resolve_input_paths(root)
     inputs = _load_inputs(paths)
@@ -1427,10 +2263,13 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
             elo_variant=cfg,
         )
         seq_builds[name] = sb
-        seq_by_variant_train[name] = sb.features.copy()
+        seq_copy = sb.features.copy()
+        seq_copy.attrs["_variant_name"] = str(name)
+        seq_by_variant_train[name] = seq_copy
 
     histgb_grid = _histgb_param_grid()
-    outer_folds = make_expanding_time_folds(train_df, n_folds=4)
+    outer_n_folds = int(runtime_cfg.fast_outer_folds) if runtime_cfg.fast_mode else 4
+    outer_folds = make_expanding_time_folds(train_df, n_folds=outer_n_folds)
 
     outer_results = []
     outer_oof_rows = []
@@ -1442,8 +2281,11 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
     postprocess_metric_rows = []
 
     for ofold in outer_folds:
+        if _budget_total_exceeded() and outer_results:
+            break
         outer_train_df_local = train_df.iloc[np.asarray(ofold["train_idx"], dtype=int)].copy().reset_index(drop=True)
-        inner_folds = make_expanding_time_folds(outer_train_df_local, n_folds=3)
+        inner_n_folds = int(runtime_cfg.fast_inner_folds) if runtime_cfg.fast_mode else 3
+        inner_folds = make_expanding_time_folds(outer_train_df_local, n_folds=inner_n_folds)
         outer_variant_data = {
             vname: _prepare_variant_outer_data(
                 train_df=train_df,
@@ -1452,6 +2294,7 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
                 seq_variant_full=seq_df,
                 team_ids=team_ids,
                 conf_values=conf_values,
+                variant_name=vname,
             )
             for vname, seq_df in seq_by_variant_train.items()
         }
@@ -1465,6 +2308,8 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
         eval_rows = []
 
         for i, cand in enumerate(top_core):
+            if _budget_total_exceeded() and eval_rows:
+                break
             vdata = outer_variant_data[cand.elo_variant]
             inner_oof, outer_val_base = _generate_inner_oof_and_outer_preds(
                 cand,
@@ -1472,6 +2317,8 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
                 histgb_grid,
                 seed=seed + 1000 + 200 * int(ofold["fold"]) + 17 * i,
             )
+            if inner_oof.empty:
+                continue
             best_post, post_metric_df, post_fold_diag, best_post_pred_rows = _select_postprocess(inner_oof, post_grid)
             post_model = _fit_postprocess_model(inner_oof, best_post)
             outer_applied = _apply_postprocess_model(outer_val_base, post_model)
@@ -1532,6 +2379,8 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
                 "pooled_outer": pooled_outer,
             }
 
+        if not eval_rows:
+            continue
         eval_df = pd.DataFrame(eval_rows).sort_values(["inner_post_rmse", "inner_post_mae", "outer_rmse"], kind="mergesort").reset_index(drop=True)
         outer_results.append(eval_df)
         chosen_key = str(eval_df.iloc[0]["core_candidate_key"])
@@ -1623,7 +2472,7 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
         else pd.DataFrame()
     )
 
-    # Final selection on full train using 3 inner folds.
+    # Final selection on full train using time-aware inner folds (capped in fast mode).
     full_idx = np.arange(len(train_df), dtype=int)
     pseudo_outer = {
         "fold": 0,
@@ -1634,7 +2483,8 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
         "val_start_date": pd.to_datetime(train_df["Date"]).min(),
         "val_end_date": pd.to_datetime(train_df["Date"]).max(),
     }
-    final_inner_folds = make_expanding_time_folds(train_df.copy().reset_index(drop=True), n_folds=3)
+    final_inner_n_folds = int(runtime_cfg.fast_inner_folds) if runtime_cfg.fast_mode else 3
+    final_inner_folds = make_expanding_time_folds(train_df.copy().reset_index(drop=True), n_folds=final_inner_n_folds)
     final_variant_data = {
         vname: _prepare_variant_outer_data(
             train_df=train_df,
@@ -1643,6 +2493,7 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
             seq_variant_full=seq_df,
             team_ids=team_ids,
             conf_values=conf_values,
+            variant_name=vname,
         )
         for vname, seq_df in seq_by_variant_train.items()
     }
@@ -1651,7 +2502,11 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
     final_bundle_lookup: Dict[str, dict] = {}
     final_eval_rows = []
     for i, cand in enumerate(final_top_core):
+        if _budget_total_exceeded() and final_eval_rows:
+            break
         inner_oof, _ = _generate_inner_oof_and_outer_preds(cand, final_variant_data[cand.elo_variant], histgb_grid, seed=seed + 8000 + 50 * i)
+        if inner_oof.empty:
+            continue
         best_post, post_metric_df, post_fold_diag, best_post_pred_rows = _select_postprocess(inner_oof, final_post_grid)
         post_model = _fit_postprocess_model(inner_oof, best_post)
         final_eval_rows.append(
@@ -1682,6 +2537,51 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
             "best_post_pred_rows": best_post_pred_rows,
             "post_metric_df": post_metric_df,
             "post_fold_diag": post_fold_diag,
+        }
+    if not final_eval_rows:
+        # Hard fallback under severe budget pressure: use first scanned core candidate with a simple pooled postprocess.
+        fallback_core = final_top_core[0]
+        inner_oof, _ = _generate_inner_oof_and_outer_preds(fallback_core, final_variant_data[fallback_core.elo_variant], histgb_grid, seed=seed + 8000)
+        fallback_post = PostprocessCandidate(regime_stack=False, calibration_mode="pooled", scale_mode="none", q50_blend=0.0, winsor_q=0.0)
+        post_model = _fit_postprocess_model(inner_oof, fallback_post) if not inner_oof.empty else PostprocessModel(
+            candidate=fallback_post,
+            thresholds={"elo_cuts": [35.0, 90.0], "vol_cut": 0.0, "info_cut": 5.0, "info_hi_cut": 8.0},
+            stack_fit={"mode": "pooled", "pred_cols": MEAN_MODEL_COLS, "pooled": np.array([0.25, 0.25, 0.25, 0.25]), "full": {}, "simple": {}, "gap": {}},
+            cal_fit={"mode": "pooled", "pooled": (0.0, 1.0), "full": {}, "simple": {}, "gap": {}},
+            scale_fit={"mode": "none", "center": 0.0, "pooled": 1.0, "full": {}, "simple": {}, "gap": {}},
+            winsor_bounds=(-np.inf, np.inf),
+            regime_summary=pd.DataFrame(),
+            calibration_summary=pd.DataFrame(),
+            scale_summary=pd.DataFrame(),
+        )
+        final_eval_rows.append(
+            {
+                "core_candidate_key": fallback_core.key(),
+                "elo_variant": fallback_core.elo_variant,
+                "feature_profile": fallback_core.feature_profile,
+                "half_life_days": np.nan if fallback_core.half_life_days is None else fallback_core.half_life_days,
+                "ridge_alpha": fallback_core.ridge_alpha,
+                "histgb_idx": fallback_core.histgb_idx,
+                "postprocess_key": fallback_post.key(),
+                "inner_rmse_final": float("inf"),
+                "inner_mae_final": float("inf"),
+                "inner_rmse_q50": float("inf"),
+                "inner_rmse_mean_stack": float("inf"),
+                "use_regime_stack": bool(fallback_post.regime_stack),
+                "calibration_mode": fallback_post.calibration_mode,
+                "scale_mode": fallback_post.scale_mode,
+                "q50_blend": fallback_post.q50_blend,
+                "winsor_q": fallback_post.winsor_q,
+            }
+        )
+        final_bundle_lookup[fallback_core.key()] = {
+            "candidate": fallback_core,
+            "inner_oof": inner_oof,
+            "best_post": fallback_post,
+            "post_model": post_model,
+            "best_post_pred_rows": pd.DataFrame({"fold": [], "row_index": [], "pred_final": []}),
+            "post_metric_df": pd.DataFrame(final_eval_rows),
+            "post_fold_diag": pd.DataFrame(),
         }
     final_eval_df = pd.DataFrame(final_eval_rows).sort_values(["inner_rmse_final", "inner_mae_final"], kind="mergesort").reset_index(drop=True)
     final_core_key = str(final_eval_df.iloc[0]["core_candidate_key"])
@@ -1750,9 +2650,12 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
 
     selected_seq_build = seq_builds[final_core_candidate.elo_variant]
     recent_form_map = _extract_recent_form_map(selected_seq_build.final_states)
-    component_oof = outer_oof[["elo_diff_pre", "massey_diff", "offdef_net_diff", "y_true"]].copy()
-    component_oof = component_oof.rename(columns={"y_true": "HomeWinMargin"})
-    component_oof["recent_form_diff"] = outer_oof["trend_margin_last5_vs_season_diff"].astype(float).to_numpy()
+    if outer_oof.empty:
+        component_oof = pd.DataFrame(columns=["elo_diff_pre", "massey_diff", "offdef_net_diff", "HomeWinMargin", "recent_form_diff"])
+    else:
+        component_oof = outer_oof[["elo_diff_pre", "massey_diff", "offdef_net_diff", "y_true"]].copy()
+        component_oof = component_oof.rename(columns={"y_true": "HomeWinMargin"})
+        component_oof["recent_form_diff"] = outer_oof["trend_margin_last5_vs_season_diff"].astype(float).to_numpy()
     ranking_weights = _compute_ranking_weights_from_oof(component_oof)
     final_net_map = static_models_full.offdef.net_rating_map()
     rankings_out = _build_rankings_output_v2(
@@ -1785,8 +2688,41 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
             {"name": "postprocess", "value": final_sel["best_post"].key()},
             {"name": "winsor_bounds", "value": str(tuple(round(float(x), 4) for x in final_post_model.winsor_bounds))},
             {"name": "dispersion_guard_factor", "value": dispersion_guard_factor},
+            {"name": "seed", "value": int(seed)},
+            {"name": "OMP_NUM_THREADS", "value": os.environ.get("OMP_NUM_THREADS", "")},
+            {"name": "MKL_NUM_THREADS", "value": os.environ.get("MKL_NUM_THREADS", "")},
         ]
     )
+
+    focus_phases = [
+        "_scan_and_select_core_candidates",
+        "_core_scan_score",
+        "_generate_inner_oof_and_outer_preds",
+        "_predict_family",
+        "_build_split_tables",
+        "_prepare_variant_outer_data",
+    ]
+    timing_summary_pre_report = _timing_summary_dict(_ACTIVE_PROFILER, top_n=10)
+    timing_summary_pre_report["focus_phase_totals_sec"] = {k: float(timing_summary_pre_report["phase_totals_sec"].get(k, 0.0)) for k in focus_phases}
+    timing_summary_pre_report["focus_phase_counts"] = {k: int(timing_summary_pre_report["phase_counts"].get(k, 0)) for k in focus_phases}
+    runtime_phase_table = _timing_phase_table(timing_summary_pre_report, focus_phases)
+    runtime_family_table = _timing_family_table(timing_summary_pre_report)
+    fast_before_summary = _load_json_if_exists(root / "timing_summary_fast_baseline.json")
+    fast_after_summary = _load_json_if_exists(root / "timing_summary_fast.json")
+    runtime_compare_table = _timing_compare_table(fast_before_summary, fast_after_summary, focus_phases) if fast_after_summary is not None else pd.DataFrame()
+    b = _budget()
+    runtime_notes = [
+        "Profile-first instrumentation added for hotspot phase totals, per-family _predict_family timing, model fit counts, and top slow events.",
+        "Shared split-level matrix/weight cache keyed by train/val index signatures + feature signature + half-life to eliminate repeated _xy/time-weight prep.",
+        "Bundled family prediction path prepares X/y/w once per split and fits Ridge/Huber/HistGB/HistGB-bag/q50 sequentially.",
+        f"HistGB bagging reduced to {runtime_cfg.histgb_bag_n_models} models by default (fast mode uses 1), with deterministic seed schedule and budget-aware auto-reduction.",
+        "Candidate scan uses conservative early pruning: coarse score on first inner split, then full evaluation on top candidates only.",
+        "Budget enforcement: total time, scan time, and fit cap stop further scanning/training and continue with best-so-far.",
+        f"Budgets triggered: {', '.join(sorted(b.triggered.keys())) if (b is not None and b.triggered) else 'none'}",
+        f"Fast mode={runtime_cfg.fast_mode}; optimization toggles enabled={runtime_cfg.enable_optimizations}.",
+        f"Reproducibility: seed={seed}, OMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS', '')}, MKL_NUM_THREADS={os.environ.get('MKL_NUM_THREADS', '')}.",
+        f"Artifact validation: predictions rows={len(pred_out)} (expected 75), rankings rows={len(rankings_out)} (expected 165), ranks unique 1..165={set(pd.to_numeric(rankings_out['Rank'], errors='coerce').fillna(-1).astype(int).tolist()) == set(range(1,166)) if 'Rank' in rankings_out.columns else False}.",
+    ]
 
     _build_report(
         root / "final_report.pdf",
@@ -1824,12 +2760,70 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
             "postprocess_key": final_sel["best_post"].key(),
             "shift_mitigation_applied": shift_mitigation_applied,
             "dispersion_guard_applied": dispersion_guard_applied,
+            "fast_mode": bool(runtime_cfg.fast_mode),
+            "budget_triggered": ", ".join(sorted(b.triggered.keys())) if (b is not None and b.triggered) else "none",
         },
         selected_hparams_table=selected_hparams_table.copy(),
+        runtime_notes=runtime_notes,
+        runtime_phase_table=runtime_phase_table,
+        runtime_family_table=runtime_family_table,
+        runtime_compare_table=runtime_compare_table,
     )
 
     outer_rmse = float(_rmse(outer_oof["y_true"].to_numpy(dtype=float), outer_oof["pred_final"].to_numpy(dtype=float))) if not outer_oof.empty else float("nan")
     outer_mae = float(_mae(outer_oof["y_true"].to_numpy(dtype=float), outer_oof["pred_final"].to_numpy(dtype=float))) if not outer_oof.empty else float("nan")
+    profiler = _ACTIVE_PROFILER
+    if profiler is not None:
+        profiler.add("run_nextgen_pipeline_total", time.perf_counter() - pipeline_t0, detail="total")
+    timing_summary = _timing_summary_dict(profiler, top_n=10)
+    timing_summary["focus_phase_totals_sec"] = {k: float(timing_summary["phase_totals_sec"].get(k, 0.0)) for k in focus_phases}
+    timing_summary["focus_phase_counts"] = {k: int(timing_summary["phase_counts"].get(k, 0)) for k in focus_phases}
+    timing_summary["seed"] = int(seed)
+    timing_summary["generated_at_utc"] = pd.Timestamp.utcnow().isoformat()
+    timing_summary["runtime_config"] = {
+        "max_total_seconds": int(runtime_cfg.max_total_seconds),
+        "max_scan_seconds": int(runtime_cfg.max_scan_seconds),
+        "max_fits": int(runtime_cfg.max_fits),
+        "fast_mode": bool(runtime_cfg.fast_mode),
+        "enable_optimizations": bool(runtime_cfg.enable_optimizations),
+        "histgb_bag_n_models": int(runtime_cfg.histgb_bag_n_models),
+    }
+    if _ACTIVE_BUDGET is not None:
+        timing_summary["budget"] = {
+            "elapsed_sec": float(_ACTIVE_BUDGET.elapsed()),
+            "fit_count": int(_ACTIVE_BUDGET.fit_count),
+            "triggered": dict(_ACTIVE_BUDGET.triggered),
+            "events": list(_ACTIVE_BUDGET.events),
+        }
+    timing_tag = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(os.environ.get("ALGOSPORTS_TIMING_TAG", "latest"))).strip("_") or "latest"
+    timing_json_path = root / f"timing_summary_{timing_tag}.json"
+    _write_json(timing_json_path, timing_summary)
+    _write_run_report(
+        root / "run_report.md",
+        root=root,
+        inputs_used=paths,
+        runtime_cfg=runtime_cfg,
+        budget=_ACTIVE_BUDGET,
+        timing_summary=timing_summary,
+        selected_summary={
+            "model_family": "Regime-aware simplex stack (Ridge/Huber/HistGB/HistGB-bag) + q50 blend",
+            "elo_variant": final_core_candidate.elo_variant,
+            "feature_profile": final_core_candidate.feature_profile,
+            "half_life_days": final_core_candidate.half_life_days,
+            "calibration_mode": final_sel["best_post"].calibration_mode,
+            "scale_mode": final_sel["best_post"].scale_mode,
+            "use_regime_stack": final_sel["best_post"].regime_stack,
+        },
+        outer_rmse=outer_rmse,
+        outer_mae=outer_mae,
+        predictions_out=pred_out,
+        rankings_out=rankings_out,
+    )
+    print("\n" + "\n".join(_timing_summary_lines(timing_summary, focus_phases=focus_phases, top_n=10)))
+    _ACTIVE_PROFILER = prev_profiler
+    _ACTIVE_RUNTIME_CFG = prev_runtime_cfg
+    _ACTIVE_BUDGET = prev_budget
+    _PIPELINE_START_PERF = prev_pipeline_start
     return {
         "selected_model_family": "Regime-aware simplex stack + q50 blend + nested calibration/scale",
         "selected_elo_variant": final_core_candidate.elo_variant,
@@ -1845,4 +2839,7 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
         "final_eval_df": final_eval_df.copy(),
         "outer_summary": outer_summary.copy(),
         "outer_fold_metrics": outer_fold_metrics.copy(),
+        "timing_summary": timing_summary,
+        "timing_summary_path": str(timing_json_path),
+        "run_report_path": str(root / "run_report.md"),
     }

@@ -9,6 +9,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence
 
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 import numpy as np
 import pandas as pd
 from scipy import stats
@@ -1186,6 +1189,7 @@ def validate_outputs_and_print_proof(root: Path) -> None:
     pred_path = root / "predictions.csv"
     rank_path = root / "rankings.xlsx"
     report_path = root / "final_report.pdf"
+    run_report_path = root / "run_report.md"
 
     if not pred_path.exists():
         raise FileNotFoundError(pred_path)
@@ -1193,8 +1197,12 @@ def validate_outputs_and_print_proof(root: Path) -> None:
         raise FileNotFoundError(rank_path)
     if not report_path.exists():
         raise FileNotFoundError(report_path)
+    if not run_report_path.exists():
+        raise FileNotFoundError(run_report_path)
     if report_path.stat().st_size <= 0:
         raise AssertionError("final_report.pdf must have size > 0")
+    if run_report_path.stat().st_size <= 0:
+        raise AssertionError("run_report.md must have size > 0")
 
     pred = pd.read_csv(pred_path)
     rank = pd.read_excel(rank_path)
@@ -1226,10 +1234,14 @@ def validate_outputs_and_print_proof(root: Path) -> None:
         f"- rankings.xlsx exists, rows={len(rank)}, Rank exactly integers 1..165={set(rank_int.tolist()) == set(range(1,166))}"
     )
     print(f"- final_report.pdf exists and file size > 0: {report_path.stat().st_size > 0} (bytes={report_path.stat().st_size})")
+    print(f"- run_report.md exists and file size > 0: {run_report_path.stat().st_size > 0} (bytes={run_report_path.stat().st_size})")
     print("\nhead(10) predictions:")
     print(pred.head(10).to_string(index=False))
     print("\nhead(10) rankings sorted by Rank:")
     print(rank.assign(Rank=rank_int).sort_values("Rank", kind="mergesort").head(10).to_string(index=False))
+    print("\nArtifact file sizes:")
+    for p in [pred_path, rank_path, report_path, run_report_path]:
+        print(f"- {p}: {p.stat().st_size} bytes")
 
 
 def main() -> None:
@@ -1242,6 +1254,15 @@ def main() -> None:
     # Next-generation nested time-aware pipeline (kept in a separate module to preserve this file's legacy helpers/report code).
     result = run_nextgen_pipeline(ROOT, seed=SEED)
     validate_outputs_and_print_proof(ROOT)
+    timing_summary = result.get("timing_summary", {}) if isinstance(result, dict) else {}
+    if timing_summary:
+        print("\nTIMING SUMMARY (Top 10 phases/call-sites)")
+        for i, row in enumerate((timing_summary.get("top_slowest_events", []) or [])[:10], start=1):
+            print(f"{i}. {row.get('phase')} [{row.get('detail','')}] {float(row.get('sec',0.0)):.3f}s")
+        fit_counts = timing_summary.get("model_fit_counts_by_family", {}) or {}
+        print("Model fit counts by family:")
+        for fam in sorted(fit_counts):
+            print(f"- {fam}: {fit_counts[fam]}")
     print("\nFINAL PIPELINE SUMMARY")
     print(f"- chosen model family: {result.get('selected_model_family')}")
     print(f"- chosen Elo variant: {result.get('selected_elo_variant')}")
@@ -1249,6 +1270,10 @@ def main() -> None:
     print(f"- calibration type: {result.get('calibration_type')}")
     print(f"- scale correction type: {result.get('scale_correction_type')}")
     print(f"- regime-specific stack used: {result.get('regime_specific_stack_used')}")
+    if result.get("timing_summary_path"):
+        print(f"- timing summary path: {result.get('timing_summary_path')}")
+    if result.get("run_report_path"):
+        print(f"- run report path: {result.get('run_report_path')}")
     return
 
     print("pwd")
