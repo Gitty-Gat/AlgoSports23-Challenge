@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -9,6 +9,7 @@ import pandas as pd
 from src.ratings import (
     ConferenceStrengthResult,
     EloResult,
+    EloVariantConfig,
     OffDefRidgeResult,
     RidgeRatingsResult,
     apply_conference_features,
@@ -18,12 +19,15 @@ from src.ratings import (
     fit_conference_strength_ridge,
     fit_massey_ridge,
     fit_offense_defense_ridge,
+    run_elo_over_games_advanced,
 )
 
 
 DEFAULT_REST_DAYS = 7.0
 PRIOR_VOL_SD = 45.0
 EMA_ALPHA = 0.2
+EMA_ALPHAS = (0.10, 0.20, 0.35)
+LAST_KS = (3, 5, 8)
 
 
 @dataclass
@@ -36,6 +40,12 @@ class TeamRollingState:
     oppadj_margin_sum: float = 0.0
     opp_elo_sum: float = 0.0
     last_date: Optional[pd.Timestamp] = None
+    ema_margin_by_alpha: Dict[float, float] = field(default_factory=dict)
+    ema_oppadj_by_alpha: Dict[float, float] = field(default_factory=dict)
+    ema_winrate_by_alpha: Dict[float, float] = field(default_factory=dict)
+    margin_history: List[float] = field(default_factory=list)
+    oppadj_history: List[float] = field(default_factory=list)
+    win_history: List[float] = field(default_factory=list)
 
 
 @dataclass
@@ -119,7 +129,29 @@ def make_expanding_time_folds(train_df: pd.DataFrame, n_folds: int = 5) -> List[
 
 
 def _default_state() -> TeamRollingState:
-    return TeamRollingState()
+    st = TeamRollingState()
+    st.ema_margin_by_alpha = {float(a): 0.0 for a in EMA_ALPHAS}
+    st.ema_oppadj_by_alpha = {float(a): 0.0 for a in EMA_ALPHAS}
+    st.ema_winrate_by_alpha = {float(a): 0.5 for a in EMA_ALPHAS}
+    return st
+
+
+def _recent_mean(values: Sequence[float], k: int, default: float = 0.0) -> float:
+    if not values:
+        return float(default)
+    tail = np.asarray(values[-int(k) :], dtype=float)
+    if tail.size == 0:
+        return float(default)
+    return float(np.mean(tail))
+
+
+def _recent_sd(values: Sequence[float], k: int, default: float) -> float:
+    if not values:
+        return float(default)
+    tail = np.asarray(values[-int(k) :], dtype=float)
+    if tail.size <= 1:
+        return float(default)
+    return float(np.std(tail, ddof=0))
 
 
 def _pregame_team_snapshot(state: TeamRollingState, game_date: pd.Timestamp) -> dict:
@@ -145,7 +177,11 @@ def _pregame_team_snapshot(state: TeamRollingState, game_date: pd.Timestamp) -> 
         if rest_days < 0:
             rest_days = 0.0
 
-    return {
+    ema_margin_vals = {a: float(state.ema_margin_by_alpha.get(a, ema_margin)) for a in EMA_ALPHAS}
+    ema_oppadj_vals = {a: float(state.ema_oppadj_by_alpha.get(a, oppadj)) for a in EMA_ALPHAS}
+    ema_winrate_vals = {a: float(state.ema_winrate_by_alpha.get(a, winrate)) for a in EMA_ALPHAS}
+
+    out = {
         "games_played": float(gp),
         "winrate": float(winrate),
         "mean_margin": float(mean_margin),
@@ -155,6 +191,20 @@ def _pregame_team_snapshot(state: TeamRollingState, game_date: pd.Timestamp) -> 
         "volatility": float(vol_sd),
         "rest_days": float(rest_days),
     }
+    for a in EMA_ALPHAS:
+        tag = str(int(round(a * 100)))
+        out[f"ema_margin_a{tag}"] = ema_margin_vals[a]
+        out[f"ema_oppadj_a{tag}"] = ema_oppadj_vals[a]
+        out[f"ema_winrate_a{tag}"] = ema_winrate_vals[a]
+
+    for k in LAST_KS:
+        out[f"last{k}_margin"] = _recent_mean(state.margin_history, k, default=mean_margin)
+        out[f"last{k}_oppadj"] = _recent_mean(state.oppadj_history, k, default=oppadj)
+        out[f"last{k}_winrate"] = _recent_mean(state.win_history, k, default=winrate)
+        out[f"last{k}_volatility"] = _recent_sd(state.margin_history, k, default=vol_sd)
+    out["consistency_ratio_last5"] = float(out["last5_volatility"] / max(vol_sd, 1e-6))
+    out["consistency_ratio_last8"] = float(out["last8_volatility"] / max(vol_sd, 1e-6))
+    return out
 
 
 def _update_team_state(
@@ -163,17 +213,33 @@ def _update_team_state(
     opp_elo_pre: float,
     game_date: pd.Timestamp,
 ) -> None:
+    margin_val = float(margin_for_team)
+    oppadj_val = margin_val - (float(opp_elo_pre) - 1500.0) / 25.0
+    win_val = 1.0 if margin_val > 0 else 0.0 if margin_val < 0 else 0.5
     state.games_played += 1
-    state.wins += 1 if margin_for_team > 0 else 0
-    state.margin_sum += float(margin_for_team)
-    state.margin_sq_sum += float(margin_for_team) ** 2
+    state.wins += 1 if margin_val > 0 else 0
+    state.margin_sum += margin_val
+    state.margin_sq_sum += margin_val**2
     if state.games_played == 1:
-        state.ema_margin = float(margin_for_team)
+        state.ema_margin = margin_val
     else:
-        state.ema_margin = EMA_ALPHA * float(margin_for_team) + (1.0 - EMA_ALPHA) * state.ema_margin
+        state.ema_margin = EMA_ALPHA * margin_val + (1.0 - EMA_ALPHA) * state.ema_margin
+    for a in EMA_ALPHAS:
+        a = float(a)
+        if state.games_played == 1:
+            state.ema_margin_by_alpha[a] = margin_val
+            state.ema_oppadj_by_alpha[a] = oppadj_val
+            state.ema_winrate_by_alpha[a] = win_val
+        else:
+            state.ema_margin_by_alpha[a] = a * margin_val + (1.0 - a) * float(state.ema_margin_by_alpha.get(a, 0.0))
+            state.ema_oppadj_by_alpha[a] = a * oppadj_val + (1.0 - a) * float(state.ema_oppadj_by_alpha.get(a, 0.0))
+            state.ema_winrate_by_alpha[a] = a * win_val + (1.0 - a) * float(state.ema_winrate_by_alpha.get(a, 0.5))
     # Opponent-adjusted margin in points; 25 Elo ~= 1 point heuristic (kept modest and stable).
-    state.oppadj_margin_sum += float(margin_for_team) - (float(opp_elo_pre) - 1500.0) / 25.0
+    state.oppadj_margin_sum += oppadj_val
     state.opp_elo_sum += float(opp_elo_pre)
+    state.margin_history.append(margin_val)
+    state.oppadj_history.append(oppadj_val)
+    state.win_history.append(win_val)
     state.last_date = pd.Timestamp(game_date)
 
 
@@ -182,16 +248,28 @@ def build_train_sequential_features(
     home_adv: float,
     team_ids: Sequence[int],
     elo_k: float = 24.0,
+    elo_variant: Optional[EloVariantConfig] = None,
 ) -> SequentialFeatureBuild:
-    elo_res: EloResult = run_elo_over_games(
-        train_df,
-        home_id_col="HomeID",
-        away_id_col="AwayID",
-        margin_col="HomeWinMargin",
-        home_adv=float(home_adv),
-        k_factor=elo_k,
-        update_ratings=True,
-    )
+    if elo_variant is None:
+        elo_res: EloResult = run_elo_over_games(
+            train_df,
+            home_id_col="HomeID",
+            away_id_col="AwayID",
+            margin_col="HomeWinMargin",
+            home_adv=float(home_adv),
+            k_factor=elo_k,
+            update_ratings=True,
+        )
+    else:
+        elo_res = run_elo_over_games_advanced(
+            train_df,
+            home_id_col="HomeID",
+            away_id_col="AwayID",
+            margin_col="HomeWinMargin",
+            config=elo_variant,
+            date_col="Date",
+            update_ratings=True,
+        )
     elo_feat = elo_res.game_features
 
     states: Dict[int, TeamRollingState] = {int(t): _default_state() for t in team_ids}
@@ -207,38 +285,77 @@ def build_train_sequential_features(
         snap_a = _pregame_team_snapshot(st_a, date)
         home_elo_pre = float(elo_feat.loc[idx, "elo_home_pre"])
         away_elo_pre = float(elo_feat.loc[idx, "elo_away_pre"])
-        rows.append(
-            {
-                "elo_home_pre": home_elo_pre,
-                "elo_away_pre": away_elo_pre,
-                "elo_diff_pre": float(elo_feat.loc[idx, "elo_diff_pre"]),
-                "elo_prob_home_pre": float(elo_feat.loc[idx, "elo_prob_home_pre"]),
-                "mean_margin_home": snap_h["mean_margin"],
-                "mean_margin_away": snap_a["mean_margin"],
-                "mean_margin_diff": snap_h["mean_margin"] - snap_a["mean_margin"],
-                "ema_margin_home": snap_h["ema_margin"],
-                "ema_margin_away": snap_a["ema_margin"],
-                "ema_margin_diff": snap_h["ema_margin"] - snap_a["ema_margin"],
-                "oppadj_margin_home": snap_h["oppadj_margin"],
-                "oppadj_margin_away": snap_a["oppadj_margin"],
-                "oppadj_margin_diff": snap_h["oppadj_margin"] - snap_a["oppadj_margin"],
-                "sos_elo_home": snap_h["sos_elo"],
-                "sos_elo_away": snap_a["sos_elo"],
-                "sos_elo_diff": snap_h["sos_elo"] - snap_a["sos_elo"],
-                "winrate_home": snap_h["winrate"],
-                "winrate_away": snap_a["winrate"],
-                "winrate_diff": snap_h["winrate"] - snap_a["winrate"],
-                "volatility_home": snap_h["volatility"],
-                "volatility_away": snap_a["volatility"],
-                "volatility_diff": snap_h["volatility"] - snap_a["volatility"],
-                "games_played_home": snap_h["games_played"],
-                "games_played_away": snap_a["games_played"],
-                "games_played_diff": snap_h["games_played"] - snap_a["games_played"],
-                "rest_days_home": snap_h["rest_days"],
-                "rest_days_away": snap_a["rest_days"],
-                "rest_days_diff": snap_h["rest_days"] - snap_a["rest_days"],
-            }
+        elo_row = elo_feat.loc[idx]
+        feat_row = {
+            "elo_home_pre": home_elo_pre,
+            "elo_away_pre": away_elo_pre,
+            "elo_diff_pre": float(elo_row.get("elo_diff_pre", home_elo_pre - away_elo_pre)),
+            "elo_neutral_diff_pre": float(elo_row.get("elo_neutral_diff_pre", home_elo_pre - away_elo_pre)),
+            "elo_prob_home_pre": float(elo_row.get("elo_prob_home_pre", 0.5)),
+            "elo_home_edge_pre": float(elo_row.get("elo_home_edge_pre", home_adv)),
+            "elo_home_team_dev_pre": float(elo_row.get("elo_home_team_dev_pre", 0.0)),
+            "elo_k_eff_pre": float(elo_row.get("elo_k_eff_pre", elo_k)),
+            "elo_gap_home_days": float(elo_row.get("elo_gap_home_days", 0.0)),
+            "elo_gap_away_days": float(elo_row.get("elo_gap_away_days", 0.0)),
+            "elo_gap_days_diff": float(elo_row.get("elo_gap_days_diff", 0.0)),
+            "mean_margin_home": snap_h["mean_margin"],
+            "mean_margin_away": snap_a["mean_margin"],
+            "mean_margin_diff": snap_h["mean_margin"] - snap_a["mean_margin"],
+            "ema_margin_home": snap_h["ema_margin"],
+            "ema_margin_away": snap_a["ema_margin"],
+            "ema_margin_diff": snap_h["ema_margin"] - snap_a["ema_margin"],
+            "oppadj_margin_home": snap_h["oppadj_margin"],
+            "oppadj_margin_away": snap_a["oppadj_margin"],
+            "oppadj_margin_diff": snap_h["oppadj_margin"] - snap_a["oppadj_margin"],
+            "sos_elo_home": snap_h["sos_elo"],
+            "sos_elo_away": snap_a["sos_elo"],
+            "sos_elo_diff": snap_h["sos_elo"] - snap_a["sos_elo"],
+            "winrate_home": snap_h["winrate"],
+            "winrate_away": snap_a["winrate"],
+            "winrate_diff": snap_h["winrate"] - snap_a["winrate"],
+            "volatility_home": snap_h["volatility"],
+            "volatility_away": snap_a["volatility"],
+            "volatility_diff": snap_h["volatility"] - snap_a["volatility"],
+            "games_played_home": snap_h["games_played"],
+            "games_played_away": snap_a["games_played"],
+            "games_played_diff": snap_h["games_played"] - snap_a["games_played"],
+            "rest_days_home": snap_h["rest_days"],
+            "rest_days_away": snap_a["rest_days"],
+            "rest_days_diff": snap_h["rest_days"] - snap_a["rest_days"],
+        }
+        for a in EMA_ALPHAS:
+            tag = str(int(round(a * 100)))
+            for stem in ["ema_margin", "ema_oppadj", "ema_winrate"]:
+                hk = f"{stem}_a{tag}"
+                feat_row[f"{hk}_home"] = float(snap_h[hk])
+                feat_row[f"{hk}_away"] = float(snap_a[hk])
+                feat_row[f"{hk}_diff"] = float(snap_h[hk] - snap_a[hk])
+        for k in LAST_KS:
+            for stem in ["margin", "oppadj", "winrate", "volatility"]:
+                hk = f"last{k}_{stem}"
+                feat_row[f"{hk}_home"] = float(snap_h[hk])
+                feat_row[f"{hk}_away"] = float(snap_a[hk])
+                feat_row[f"{hk}_diff"] = float(snap_h[hk] - snap_a[hk])
+        feat_row["trend_margin_last3_vs_season_home"] = float(snap_h["last3_margin"] - snap_h["mean_margin"])
+        feat_row["trend_margin_last3_vs_season_away"] = float(snap_a["last3_margin"] - snap_a["mean_margin"])
+        feat_row["trend_margin_last3_vs_season_diff"] = float(
+            feat_row["trend_margin_last3_vs_season_home"] - feat_row["trend_margin_last3_vs_season_away"]
         )
+        feat_row["trend_margin_last5_vs_season_home"] = float(snap_h["last5_margin"] - snap_h["mean_margin"])
+        feat_row["trend_margin_last5_vs_season_away"] = float(snap_a["last5_margin"] - snap_a["mean_margin"])
+        feat_row["trend_margin_last5_vs_season_diff"] = float(
+            feat_row["trend_margin_last5_vs_season_home"] - feat_row["trend_margin_last5_vs_season_away"]
+        )
+        feat_row["trend_oppadj_last5_vs_season_home"] = float(snap_h["last5_oppadj"] - snap_h["oppadj_margin"])
+        feat_row["trend_oppadj_last5_vs_season_away"] = float(snap_a["last5_oppadj"] - snap_a["oppadj_margin"])
+        feat_row["trend_oppadj_last5_vs_season_diff"] = float(
+            feat_row["trend_oppadj_last5_vs_season_home"] - feat_row["trend_oppadj_last5_vs_season_away"]
+        )
+        feat_row["consistency_ratio_home"] = float(snap_h["consistency_ratio_last5"])
+        feat_row["consistency_ratio_away"] = float(snap_a["consistency_ratio_last5"])
+        feat_row["consistency_ratio_diff"] = float(snap_h["consistency_ratio_last5"] - snap_a["consistency_ratio_last5"])
+        feat_row["low_info_matchup_flag"] = float(min(snap_h["games_played"], snap_a["games_played"]) < 5.0)
+        rows.append(feat_row)
 
         margin = float(row["HomeWinMargin"])
         _update_team_state(st_h, margin_for_team=margin, opp_elo_pre=away_elo_pre, game_date=date)
@@ -268,38 +385,76 @@ def build_derby_sequential_features(
         # Elo probability with neutral site.
         elo_prob = 1.0 / (1.0 + np.power(10.0, -elo_diff / 400.0))
 
-        rows.append(
-            {
-                "elo_home_pre": elo1,
-                "elo_away_pre": elo2,
-                "elo_diff_pre": elo_diff,
-                "elo_prob_home_pre": float(elo_prob),
-                "mean_margin_home": snap1["mean_margin"],
-                "mean_margin_away": snap2["mean_margin"],
-                "mean_margin_diff": snap1["mean_margin"] - snap2["mean_margin"],
-                "ema_margin_home": snap1["ema_margin"],
-                "ema_margin_away": snap2["ema_margin"],
-                "ema_margin_diff": snap1["ema_margin"] - snap2["ema_margin"],
-                "oppadj_margin_home": snap1["oppadj_margin"],
-                "oppadj_margin_away": snap2["oppadj_margin"],
-                "oppadj_margin_diff": snap1["oppadj_margin"] - snap2["oppadj_margin"],
-                "sos_elo_home": snap1["sos_elo"],
-                "sos_elo_away": snap2["sos_elo"],
-                "sos_elo_diff": snap1["sos_elo"] - snap2["sos_elo"],
-                "winrate_home": snap1["winrate"],
-                "winrate_away": snap2["winrate"],
-                "winrate_diff": snap1["winrate"] - snap2["winrate"],
-                "volatility_home": snap1["volatility"],
-                "volatility_away": snap2["volatility"],
-                "volatility_diff": snap1["volatility"] - snap2["volatility"],
-                "games_played_home": snap1["games_played"],
-                "games_played_away": snap2["games_played"],
-                "games_played_diff": snap1["games_played"] - snap2["games_played"],
-                "rest_days_home": snap1["rest_days"],
-                "rest_days_away": snap2["rest_days"],
-                "rest_days_diff": snap1["rest_days"] - snap2["rest_days"],
-            }
+        feat_row = {
+            "elo_home_pre": elo1,
+            "elo_away_pre": elo2,
+            "elo_diff_pre": elo_diff,
+            "elo_neutral_diff_pre": elo_diff,
+            "elo_prob_home_pre": float(elo_prob),
+            "elo_home_edge_pre": 0.0,
+            "elo_home_team_dev_pre": 0.0,
+            "elo_k_eff_pre": 0.0,
+            "elo_gap_home_days": 0.0,
+            "elo_gap_away_days": 0.0,
+            "elo_gap_days_diff": 0.0,
+            "mean_margin_home": snap1["mean_margin"],
+            "mean_margin_away": snap2["mean_margin"],
+            "mean_margin_diff": snap1["mean_margin"] - snap2["mean_margin"],
+            "ema_margin_home": snap1["ema_margin"],
+            "ema_margin_away": snap2["ema_margin"],
+            "ema_margin_diff": snap1["ema_margin"] - snap2["ema_margin"],
+            "oppadj_margin_home": snap1["oppadj_margin"],
+            "oppadj_margin_away": snap2["oppadj_margin"],
+            "oppadj_margin_diff": snap1["oppadj_margin"] - snap2["oppadj_margin"],
+            "sos_elo_home": snap1["sos_elo"],
+            "sos_elo_away": snap2["sos_elo"],
+            "sos_elo_diff": snap1["sos_elo"] - snap2["sos_elo"],
+            "winrate_home": snap1["winrate"],
+            "winrate_away": snap2["winrate"],
+            "winrate_diff": snap1["winrate"] - snap2["winrate"],
+            "volatility_home": snap1["volatility"],
+            "volatility_away": snap2["volatility"],
+            "volatility_diff": snap1["volatility"] - snap2["volatility"],
+            "games_played_home": snap1["games_played"],
+            "games_played_away": snap2["games_played"],
+            "games_played_diff": snap1["games_played"] - snap2["games_played"],
+            "rest_days_home": snap1["rest_days"],
+            "rest_days_away": snap2["rest_days"],
+            "rest_days_diff": snap1["rest_days"] - snap2["rest_days"],
+        }
+        for a in EMA_ALPHAS:
+            tag = str(int(round(a * 100)))
+            for stem in ["ema_margin", "ema_oppadj", "ema_winrate"]:
+                hk = f"{stem}_a{tag}"
+                feat_row[f"{hk}_home"] = float(snap1[hk])
+                feat_row[f"{hk}_away"] = float(snap2[hk])
+                feat_row[f"{hk}_diff"] = float(snap1[hk] - snap2[hk])
+        for k in LAST_KS:
+            for stem in ["margin", "oppadj", "winrate", "volatility"]:
+                hk = f"last{k}_{stem}"
+                feat_row[f"{hk}_home"] = float(snap1[hk])
+                feat_row[f"{hk}_away"] = float(snap2[hk])
+                feat_row[f"{hk}_diff"] = float(snap1[hk] - snap2[hk])
+        feat_row["trend_margin_last3_vs_season_home"] = float(snap1["last3_margin"] - snap1["mean_margin"])
+        feat_row["trend_margin_last3_vs_season_away"] = float(snap2["last3_margin"] - snap2["mean_margin"])
+        feat_row["trend_margin_last3_vs_season_diff"] = float(
+            feat_row["trend_margin_last3_vs_season_home"] - feat_row["trend_margin_last3_vs_season_away"]
         )
+        feat_row["trend_margin_last5_vs_season_home"] = float(snap1["last5_margin"] - snap1["mean_margin"])
+        feat_row["trend_margin_last5_vs_season_away"] = float(snap2["last5_margin"] - snap2["mean_margin"])
+        feat_row["trend_margin_last5_vs_season_diff"] = float(
+            feat_row["trend_margin_last5_vs_season_home"] - feat_row["trend_margin_last5_vs_season_away"]
+        )
+        feat_row["trend_oppadj_last5_vs_season_home"] = float(snap1["last5_oppadj"] - snap1["oppadj_margin"])
+        feat_row["trend_oppadj_last5_vs_season_away"] = float(snap2["last5_oppadj"] - snap2["oppadj_margin"])
+        feat_row["trend_oppadj_last5_vs_season_diff"] = float(
+            feat_row["trend_oppadj_last5_vs_season_home"] - feat_row["trend_oppadj_last5_vs_season_away"]
+        )
+        feat_row["consistency_ratio_home"] = float(snap1["consistency_ratio_last5"])
+        feat_row["consistency_ratio_away"] = float(snap2["consistency_ratio_last5"])
+        feat_row["consistency_ratio_diff"] = float(snap1["consistency_ratio_last5"] - snap2["consistency_ratio_last5"])
+        feat_row["low_info_matchup_flag"] = float(min(snap1["games_played"], snap2["games_played"]) < 5.0)
+        rows.append(feat_row)
     return pd.DataFrame(rows, index=pred_df.index)
 
 
@@ -364,5 +519,47 @@ def assemble_model_table(base_rows: pd.DataFrame, sequential_df: pd.DataFrame, s
     if conf_cols:
         conf_df = pd.concat(conf_cols, axis=1).reset_index(drop=True)
         df = pd.concat([df, conf_df], axis=1)
+    # Pregame-only interaction features for regime-aware and nonlinear models.
+    if "HomeConf" in base_rows.columns and "AwayConf" in base_rows.columns:
+        same_conf = (base_rows["HomeConf"].astype(str).to_numpy() == base_rows["AwayConf"].astype(str).to_numpy()).astype(float)
+        df["same_conf_flag"] = same_conf
+        df["cross_conf_flag"] = 1.0 - same_conf
+    elif "Team1_Conf" in base_rows.columns and "Team2_Conf" in base_rows.columns:
+        same_conf = (base_rows["Team1_Conf"].astype(str).to_numpy() == base_rows["Team2_Conf"].astype(str).to_numpy()).astype(float)
+        df["same_conf_flag"] = same_conf
+        df["cross_conf_flag"] = 1.0 - same_conf
+    if "elo_diff_pre" in df.columns:
+        abs_elo = np.abs(df["elo_diff_pre"].astype(float).to_numpy())
+        df["elo_abs_pre"] = abs_elo
+        df["elo_close_flag"] = (abs_elo < 35.0).astype(float)
+        df["elo_moderate_flag"] = ((abs_elo >= 35.0) & (abs_elo < 90.0)).astype(float)
+        df["elo_mismatch_flag"] = (abs_elo >= 90.0).astype(float)
+    if "volatility_home" in df.columns and "volatility_away" in df.columns:
+        vh = df["volatility_home"].astype(float).to_numpy()
+        va = df["volatility_away"].astype(float).to_numpy()
+        vs = vh + va
+        df["volatility_sum"] = vs
+        df["volatility_ratio_home_away"] = vh / np.maximum(va, 1e-6)
+        df["volatility_ratio_away_home"] = va / np.maximum(vh, 1e-6)
+    if "elo_diff_pre" in df.columns and "volatility_diff" in df.columns:
+        df["vol_x_elo_diff"] = (df["volatility_diff"].astype(float) * df["elo_diff_pre"].astype(float)) / 50.0
+    if "same_conf_flag" in df.columns and "elo_diff_pre" in df.columns:
+        df["same_conf_x_elo_diff"] = df["same_conf_flag"].astype(float) * df["elo_diff_pre"].astype(float)
+        df["cross_conf_x_elo_diff"] = df["cross_conf_flag"].astype(float) * df["elo_diff_pre"].astype(float)
+    if "games_played_home" in df.columns and "games_played_away" in df.columns:
+        gp_min = np.minimum(df["games_played_home"].astype(float), df["games_played_away"].astype(float))
+        gp_max = np.maximum(df["games_played_home"].astype(float), df["games_played_away"].astype(float))
+        df["games_played_min"] = gp_min
+        df["games_played_max"] = gp_max
+        df["low_info_matchup_flag2"] = (gp_min < 5.0).astype(float)
+        df["high_info_matchup_flag"] = (gp_min >= 8.0).astype(float)
+    if "offdef_margin_with_side" in df.columns and "offdef_margin_neutral" in df.columns:
+        df["offdef_home_effect_component"] = (
+            df["offdef_margin_with_side"].astype(float) - df["offdef_margin_neutral"].astype(float)
+        )
+    if "massey_home_rating" in df.columns and "massey_away_rating" in df.columns:
+        df["massey_neutral_component"] = (
+            df["massey_home_rating"].astype(float) - df["massey_away_rating"].astype(float)
+        )
     return df
 

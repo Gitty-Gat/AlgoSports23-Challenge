@@ -28,6 +28,188 @@ class EloResult:
     final_ratings: Dict[int, float]
 
 
+@dataclass(frozen=True)
+class EloVariantConfig:
+    name: str = "base"
+    home_adv: float = 0.0
+    k_factor: float = 24.0
+    initial_rating: float = 1500.0
+    use_dynamic_k: bool = False
+    k_early_multiplier: float = 0.75
+    k_games_scale: float = 18.0
+    k_uncertainty_multiplier: float = 0.35
+    use_team_home_adv: bool = False
+    team_home_adv_scale: float = 70.0
+    team_home_adv_reg: float = 6.0
+    team_home_adv_cap: float = 50.0
+    use_inactivity_decay: bool = False
+    inactivity_tau_days: float = 120.0
+    use_mov_multiplier: bool = True
+
+
+def _decay_rating_toward_mean(rating: float, gap_days: float, tau_days: float, mean: float = 1500.0) -> float:
+    if tau_days <= 0 or gap_days <= 0:
+        return float(rating)
+    w = float(np.exp(-float(gap_days) / float(tau_days)))
+    return float(mean + w * (float(rating) - mean))
+
+
+def _team_home_dev_elo(
+    team_id: int,
+    resid_sum: Mapping[int, float],
+    resid_n: Mapping[int, int],
+    scale: float,
+    reg: float,
+    cap: float,
+) -> float:
+    n = float(resid_n.get(int(team_id), 0))
+    s = float(resid_sum.get(int(team_id), 0.0))
+    shrunk = s / max(n + float(reg), 1.0)
+    dev = float(scale) * shrunk
+    return float(np.clip(dev, -abs(float(cap)), abs(float(cap))))
+
+
+def run_elo_over_games_advanced(
+    games: pd.DataFrame,
+    home_id_col: str,
+    away_id_col: str,
+    margin_col: str,
+    *,
+    config: EloVariantConfig,
+    date_col: str = "Date",
+    starting_ratings: Optional[Mapping[int, float]] = None,
+    update_ratings: bool = True,
+) -> EloResult:
+    ratings: Dict[int, float] = dict(starting_ratings or {})
+    games_played: Dict[int, int] = {}
+    last_seen: Dict[int, pd.Timestamp] = {}
+    home_resid_sum: Dict[int, float] = {}
+    home_resid_n: Dict[int, int] = {}
+
+    pre_home = []
+    pre_away = []
+    elo_diff_pre = []
+    elo_diff_neutral = []
+    elo_prob_home = []
+    elo_home_edge = []
+    elo_home_dev = []
+    elo_k_eff = []
+    gap_home_days = []
+    gap_away_days = []
+
+    for row in games.itertuples(index=False):
+        home_id = int(getattr(row, home_id_col))
+        away_id = int(getattr(row, away_id_col))
+        dt_raw = getattr(row, date_col, None)
+        game_date = pd.Timestamp(dt_raw) if dt_raw is not None else pd.NaT
+
+        home_gap = 0.0
+        away_gap = 0.0
+        if pd.notna(game_date):
+            if config.use_inactivity_decay and config.inactivity_tau_days > 0:
+                if home_id in last_seen:
+                    home_gap = float(max((game_date - last_seen[home_id]).days, 0))
+                    ratings[home_id] = _decay_rating_toward_mean(
+                        ratings.get(home_id, config.initial_rating),
+                        gap_days=home_gap,
+                        tau_days=config.inactivity_tau_days,
+                        mean=config.initial_rating,
+                    )
+                if away_id in last_seen:
+                    away_gap = float(max((game_date - last_seen[away_id]).days, 0))
+                    ratings[away_id] = _decay_rating_toward_mean(
+                        ratings.get(away_id, config.initial_rating),
+                        gap_days=away_gap,
+                        tau_days=config.inactivity_tau_days,
+                        mean=config.initial_rating,
+                    )
+            else:
+                if home_id in last_seen:
+                    home_gap = float(max((game_date - last_seen[home_id]).days, 0))
+                if away_id in last_seen:
+                    away_gap = float(max((game_date - last_seen[away_id]).days, 0))
+
+        home_elo = float(ratings.get(home_id, config.initial_rating))
+        away_elo = float(ratings.get(away_id, config.initial_rating))
+        diff_neutral = float(home_elo - away_elo)
+
+        team_dev = 0.0
+        if config.use_team_home_adv:
+            team_dev = _team_home_dev_elo(
+                home_id,
+                resid_sum=home_resid_sum,
+                resid_n=home_resid_n,
+                scale=config.team_home_adv_scale,
+                reg=config.team_home_adv_reg,
+                cap=config.team_home_adv_cap,
+            )
+        home_edge = float(config.home_adv + team_dev)
+        diff_ha = float(diff_neutral + home_edge)
+        p_home = float(elo_expected_score(diff_ha))
+
+        k_eff = float(config.k_factor)
+        if config.use_dynamic_k:
+            gp_home = float(games_played.get(home_id, 0))
+            gp_away = float(games_played.get(away_id, 0))
+            gp_pair = 0.5 * (gp_home + gp_away)
+            early_mult = 1.0 + float(config.k_early_multiplier) * float(
+                np.exp(-gp_pair / max(float(config.k_games_scale), 1e-6))
+            )
+            uncertainty = 4.0 * p_home * (1.0 - p_home)  # [0,1], highest on coin flips
+            unc_mult = 1.0 + float(config.k_uncertainty_multiplier) * float(uncertainty)
+            k_eff *= early_mult * unc_mult
+        k_eff = float(np.clip(k_eff, 4.0, 80.0))
+
+        pre_home.append(home_elo)
+        pre_away.append(away_elo)
+        elo_diff_pre.append(diff_ha)
+        elo_diff_neutral.append(diff_neutral)
+        elo_prob_home.append(p_home)
+        elo_home_edge.append(home_edge)
+        elo_home_dev.append(team_dev)
+        elo_k_eff.append(k_eff)
+        gap_home_days.append(home_gap)
+        gap_away_days.append(away_gap)
+
+        if update_ratings:
+            margin = float(getattr(row, margin_col))
+            score_home = 1.0 if margin > 0 else 0.0 if margin < 0 else 0.5
+            mult = elo_mov_multiplier(margin, diff_ha) if config.use_mov_multiplier else 1.0
+            delta = k_eff * float(mult) * (score_home - p_home)
+            ratings[home_id] = home_elo + delta
+            ratings[away_id] = away_elo - delta
+
+            if config.use_team_home_adv:
+                # Estimate a team-specific home bump from binary surprise at home, shrunk in `_team_home_dev_elo`.
+                p_neutral = float(elo_expected_score(diff_neutral))
+                home_resid_sum[home_id] = float(home_resid_sum.get(home_id, 0.0) + (score_home - p_neutral))
+                home_resid_n[home_id] = int(home_resid_n.get(home_id, 0) + 1)
+
+            games_played[home_id] = int(games_played.get(home_id, 0) + 1)
+            games_played[away_id] = int(games_played.get(away_id, 0) + 1)
+            if pd.notna(game_date):
+                last_seen[home_id] = game_date
+                last_seen[away_id] = game_date
+
+    features = pd.DataFrame(
+        {
+            "elo_home_pre": pre_home,
+            "elo_away_pre": pre_away,
+            "elo_diff_pre": elo_diff_pre,
+            "elo_neutral_diff_pre": elo_diff_neutral,
+            "elo_prob_home_pre": elo_prob_home,
+            "elo_home_edge_pre": elo_home_edge,
+            "elo_home_team_dev_pre": elo_home_dev,
+            "elo_k_eff_pre": elo_k_eff,
+            "elo_gap_home_days": gap_home_days,
+            "elo_gap_away_days": gap_away_days,
+            "elo_gap_days_diff": (np.asarray(gap_home_days, dtype=float) - np.asarray(gap_away_days, dtype=float)),
+        },
+        index=games.index,
+    )
+    return EloResult(game_features=features, final_ratings=ratings)
+
+
 def run_elo_over_games(
     games: pd.DataFrame,
     home_id_col: str,

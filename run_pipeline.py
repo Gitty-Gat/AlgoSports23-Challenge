@@ -37,6 +37,7 @@ from src.features import (
     parse_predictions,
 )
 from src.ratings import tune_home_advantage_elo
+from src.nextgen_pipeline import run_nextgen_pipeline
 
 
 SEED = 23
@@ -1217,8 +1218,13 @@ def validate_outputs_and_print_proof(root: Path) -> None:
         raise AssertionError("rankings.xlsx Rank must be exactly unique 1..165")
 
     print("\nPROOF OF COMPLETION")
-    print(f"- predictions.csv exists, {len(pred)} rows, no missing Team1_WinMargin: {not pred['Team1_WinMargin'].isna().any()}")
-    print(f"- rankings.xlsx exists, {len(rank)} rows, Rank unique 1..165: {set(rank_int.tolist()) == set(range(1,166))}")
+    pred_numeric_ok = bool(pd.to_numeric(pred["Team1_WinMargin"], errors="coerce").notna().all())
+    print(
+        f"- predictions.csv exists, rows={len(pred)}, Team1_WinMargin no missing={not pred['Team1_WinMargin'].isna().any()}, numeric={pred_numeric_ok}"
+    )
+    print(
+        f"- rankings.xlsx exists, rows={len(rank)}, Rank exactly integers 1..165={set(rank_int.tolist()) == set(range(1,166))}"
+    )
     print(f"- final_report.pdf exists and file size > 0: {report_path.stat().st_size > 0} (bytes={report_path.stat().st_size})")
     print("\nhead(10) predictions:")
     print(pred.head(10).to_string(index=False))
@@ -1230,7 +1236,20 @@ def main() -> None:
     warnings.filterwarnings("ignore", category=FutureWarning)
     warnings.filterwarnings("ignore", category=UserWarning)
     warnings.filterwarnings("ignore", category=RuntimeWarning)
+    warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
     set_deterministic(SEED)
+
+    # Next-generation nested time-aware pipeline (kept in a separate module to preserve this file's legacy helpers/report code).
+    result = run_nextgen_pipeline(ROOT, seed=SEED)
+    validate_outputs_and_print_proof(ROOT)
+    print("\nFINAL PIPELINE SUMMARY")
+    print(f"- chosen model family: {result.get('selected_model_family')}")
+    print(f"- chosen Elo variant: {result.get('selected_elo_variant')}")
+    print(f"- nested outer RMSE/MAE: {result.get('nested_outer_rmse'):.5f} / {result.get('nested_outer_mae'):.5f}")
+    print(f"- calibration type: {result.get('calibration_type')}")
+    print(f"- scale correction type: {result.get('scale_correction_type')}")
+    print(f"- regime-specific stack used: {result.get('regime_specific_stack_used')}")
+    return
 
     print("pwd")
     print(str(ROOT))
