@@ -350,3 +350,298 @@ def apply_conference_features(
         },
         index=rows.index,
     )
+
+
+def detect_season_indices_by_gap(date_series: Sequence[pd.Timestamp], gap_days: int = 60) -> Tuple[np.ndarray, np.ndarray, Dict[int, int]]:
+    d = pd.to_datetime(pd.Series(date_series)).reset_index(drop=True)
+    n = len(d)
+    season_id = np.zeros(n, dtype=int)
+    cur = 0
+    for i in range(1, n):
+        if (pd.Timestamp(d.iloc[i]) - pd.Timestamp(d.iloc[i - 1])).days > int(gap_days):
+            cur += 1
+        season_id[i] = cur
+    game_idx = np.zeros(n, dtype=int)
+    season_len: Dict[int, int] = {}
+    for s in np.unique(season_id):
+        idx = np.flatnonzero(season_id == s)
+        game_idx[idx] = np.arange(len(idx), dtype=int)
+        season_len[int(s)] = int(len(idx))
+    return season_id, game_idx, season_len
+
+
+def elo_k_decay_multiplier(
+    decay_type: str,
+    A: float,
+    game_index_in_season: int,
+    season_length: int,
+    G: int = 100,
+    tau: float = 50.0,
+) -> float:
+    A = max(float(A), 0.0)
+    if A <= 0:
+        return 1.0
+    if str(decay_type).lower() == "linear":
+        Ge = max(1, min(int(G), int(season_length)))
+        return float(1.0 + A * max(0.0, 1.0 - float(game_index_in_season) / float(Ge)))
+    tau_eff = max(float(tau), 1.0)
+    return float(1.0 + A * np.exp(-float(game_index_in_season) / tau_eff))
+
+
+def fit_colley_ratings(
+    games: pd.DataFrame,
+    team_ids: Sequence[int],
+    home_id_col: str = "HomeID",
+    away_id_col: str = "AwayID",
+    margin_col: str = "HomeWinMargin",
+) -> Dict[int, float]:
+    team_ids = [int(t) for t in team_ids]
+    n = len(team_ids)
+    if n == 0:
+        return {}
+    pos = {tid: i for i, tid in enumerate(team_ids)}
+    C = np.zeros((n, n), dtype=float)
+    b = np.ones(n, dtype=float)
+    wins = np.zeros(n, dtype=float)
+    losses = np.zeros(n, dtype=float)
+
+    for row in games.itertuples(index=False):
+        h = pos.get(int(getattr(row, home_id_col)))
+        a = pos.get(int(getattr(row, away_id_col)))
+        if h is None or a is None:
+            continue
+        C[h, h] += 1.0
+        C[a, a] += 1.0
+        C[h, a] -= 1.0
+        C[a, h] -= 1.0
+        m = float(getattr(row, margin_col))
+        if m > 0:
+            wins[h] += 1.0
+            losses[a] += 1.0
+        elif m < 0:
+            wins[a] += 1.0
+            losses[h] += 1.0
+        else:
+            wins[h] += 0.5
+            losses[h] += 0.5
+            wins[a] += 0.5
+            losses[a] += 0.5
+
+    C += 2.0 * np.eye(n)
+    b += 0.5 * (wins - losses)
+    try:
+        r = np.linalg.solve(C, b)
+    except np.linalg.LinAlgError:
+        r = np.linalg.lstsq(C, b, rcond=None)[0]
+    r = np.asarray(r, dtype=float)
+    r = r - np.mean(r) if n else r
+    return {tid: float(r[pos[tid]]) for tid in team_ids}
+
+
+def apply_colley_features(
+    rows: pd.DataFrame,
+    colley_ratings: Mapping[int, float],
+    home_id_col: str,
+    away_id_col: str,
+) -> pd.DataFrame:
+    hr = rows[home_id_col].astype(int).map(colley_ratings).fillna(0.0).astype(float)
+    ar = rows[away_id_col].astype(int).map(colley_ratings).fillna(0.0).astype(float)
+    return pd.DataFrame(
+        {
+            "colley_home_rating": hr.to_numpy(),
+            "colley_away_rating": ar.to_numpy(),
+            "colley_diff": (hr - ar).to_numpy(),
+        },
+        index=rows.index,
+    )
+
+
+@dataclass
+class EloKDecayConfig:
+    home_adv: float = 50.0
+    k_factor: float = 24.0
+    initial_rating: float = 1500.0
+    use_mov: bool = True
+    decay_type: str = "linear"  # linear | exponential
+    A: float = 0.0
+    G: int = 100
+    tau: float = 50.0
+    season_gap_days: int = 60
+
+
+@dataclass
+class EloKDecayFitResult:
+    final_ratings: Dict[int, float]
+    train_features: pd.DataFrame
+
+
+class EloKDecayRatingComponent:
+    def __init__(self, config: EloKDecayConfig):
+        self.config = config
+        self.final_ratings: Dict[int, float] = {}
+        self._fitted = False
+
+    def fit(
+        self,
+        games: pd.DataFrame,
+        home_id_col: str = "HomeID",
+        away_id_col: str = "AwayID",
+        margin_col: str = "HomeWinMargin",
+        date_col: str = "Date",
+    ) -> Dict[int, float]:
+        self.fit_transform_train(games, home_id_col=home_id_col, away_id_col=away_id_col, margin_col=margin_col, date_col=date_col)
+        return dict(self.final_ratings)
+
+    def fit_transform_train(
+        self,
+        games: pd.DataFrame,
+        home_id_col: str = "HomeID",
+        away_id_col: str = "AwayID",
+        margin_col: str = "HomeWinMargin",
+        date_col: str = "Date",
+    ) -> EloKDecayFitResult:
+        cfg = self.config
+        season_id, game_idx, season_len = detect_season_indices_by_gap(games[date_col], gap_days=cfg.season_gap_days)
+        ratings: Dict[int, float] = {}
+        recs: List[dict] = []
+
+        for i, row in enumerate(games.itertuples(index=False)):
+            hid = int(getattr(row, home_id_col))
+            aid = int(getattr(row, away_id_col))
+            h = float(ratings.get(hid, cfg.initial_rating))
+            a = float(ratings.get(aid, cfg.initial_rating))
+            ha = float(cfg.home_adv)
+            diff = h - a + ha
+            p_home = float(elo_expected_score(diff))
+            s = int(season_id[i]) if len(season_id) else 0
+            g = int(game_idx[i]) if len(game_idx) else i
+            km = elo_k_decay_multiplier(cfg.decay_type, cfg.A, g, season_len.get(s, len(games)), G=cfg.G, tau=cfg.tau)
+            recs.append(
+                {
+                    "elo_home_pre": h,
+                    "elo_away_pre": a,
+                    "elo_diff_pre": diff,
+                    "elo_prob_home_pre": p_home,
+                    "elo_k_mult": km,
+                    "elo_season_id": s,
+                    "elo_games_into_season": g,
+                }
+            )
+
+            margin = float(getattr(row, margin_col))
+            score_home = 1.0 if margin > 0 else 0.0 if margin < 0 else 0.5
+            mov_mult = elo_mov_multiplier(margin, diff) if cfg.use_mov else 1.0
+            delta = float(cfg.k_factor) * km * float(mov_mult) * (score_home - p_home)
+            ratings[hid] = h + delta
+            ratings[aid] = a - delta
+
+        self.final_ratings = ratings
+        self._fitted = True
+        return EloKDecayFitResult(final_ratings=dict(ratings), train_features=pd.DataFrame(recs, index=games.index))
+
+    def transform_rows(
+        self,
+        rows: pd.DataFrame,
+        home_id_col: str,
+        away_id_col: str,
+        neutral_site: bool = False,
+    ) -> pd.DataFrame:
+        if not self._fitted:
+            raise RuntimeError("EloKDecayRatingComponent must be fit before transform_rows")
+        h = rows[home_id_col].astype(int).map(self.final_ratings).fillna(self.config.initial_rating).astype(float)
+        a = rows[away_id_col].astype(int).map(self.final_ratings).fillna(self.config.initial_rating).astype(float)
+        ha = 0.0 if neutral_site else float(self.config.home_adv)
+        diff = h - a + ha
+        p_home = elo_expected_score(diff.to_numpy())
+        return pd.DataFrame(
+            {
+                "elo_home_pre": h.to_numpy(),
+                "elo_away_pre": a.to_numpy(),
+                "elo_diff_pre": diff.to_numpy(),
+                "elo_prob_home_pre": np.asarray(p_home, dtype=float),
+            },
+            index=rows.index,
+        )
+
+    def predict_feature(self, game_row: pd.Series, home_id_col: str = "HomeID", away_id_col: str = "AwayID", neutral_site: bool = False) -> float:
+        if not self._fitted:
+            raise RuntimeError("EloKDecayRatingComponent must be fit before predict_feature")
+        hid = int(game_row[home_id_col])
+        aid = int(game_row[away_id_col])
+        h = float(self.final_ratings.get(hid, self.config.initial_rating))
+        a = float(self.final_ratings.get(aid, self.config.initial_rating))
+        ha = 0.0 if neutral_site else float(self.config.home_adv)
+        return float(h - a + ha)
+
+
+class MasseyRatingComponent:
+    def __init__(self, alpha: float = 30.0):
+        self.alpha = float(alpha)
+        self.fit_result: Optional[RidgeRatingsResult] = None
+
+    def fit(self, games: pd.DataFrame, team_ids: Sequence[int]) -> Dict[int, float]:
+        self.fit_result = fit_massey_ridge(games, team_ids=team_ids, alpha=self.alpha)
+        return dict(self.fit_result.team_rating)
+
+    def transform_rows(self, rows: pd.DataFrame, home_id_col: str, away_id_col: str, neutral_site: bool = False) -> pd.DataFrame:
+        if self.fit_result is None:
+            raise RuntimeError("MasseyRatingComponent must be fit before transform_rows")
+        return apply_massey_features(rows, self.fit_result, home_id_col, away_id_col, neutral_site=neutral_site)
+
+    def predict_feature(self, game_row: pd.Series, home_id_col: str = "HomeID", away_id_col: str = "AwayID", neutral_site: bool = False) -> float:
+        if self.fit_result is None:
+            raise RuntimeError("MasseyRatingComponent must be fit before predict_feature")
+        hr = float(self.fit_result.team_rating.get(int(game_row[home_id_col]), 0.0))
+        ar = float(self.fit_result.team_rating.get(int(game_row[away_id_col]), 0.0))
+        h = 0.0 if neutral_site else float(self.fit_result.home_adv)
+        return float(hr - ar + h + float(self.fit_result.intercept))
+
+
+class ColleyRatingComponent:
+    def __init__(self):
+        self.colley_ratings: Dict[int, float] = {}
+        self._fitted = False
+
+    def fit(self, games: pd.DataFrame, team_ids: Sequence[int]) -> Dict[int, float]:
+        self.colley_ratings = fit_colley_ratings(games, team_ids=team_ids)
+        self._fitted = True
+        return dict(self.colley_ratings)
+
+    def transform_rows(self, rows: pd.DataFrame, home_id_col: str, away_id_col: str) -> pd.DataFrame:
+        if not self._fitted:
+            raise RuntimeError("ColleyRatingComponent must be fit before transform_rows")
+        return apply_colley_features(rows, self.colley_ratings, home_id_col, away_id_col)
+
+    def predict_feature(self, game_row: pd.Series, home_id_col: str = "HomeID", away_id_col: str = "AwayID", neutral_site: bool = False) -> float:
+        if not self._fitted:
+            raise RuntimeError("ColleyRatingComponent must be fit before predict_feature")
+        hr = float(self.colley_ratings.get(int(game_row[home_id_col]), 0.0))
+        ar = float(self.colley_ratings.get(int(game_row[away_id_col]), 0.0))
+        return float(hr - ar)
+
+
+class OffDefNetRatingComponent:
+    def __init__(self, alpha: float = 20.0):
+        self.alpha = float(alpha)
+        self.fit_result: Optional[OffDefRidgeResult] = None
+
+    def fit(self, games: pd.DataFrame, team_ids: Sequence[int]) -> Dict[int, float]:
+        self.fit_result = fit_offense_defense_ridge(games, team_ids=team_ids, alpha=self.alpha)
+        return dict(self.fit_result.net_rating_map())
+
+    def transform_rows(self, rows: pd.DataFrame, home_id_col: str, away_id_col: str, neutral_site: bool = False) -> pd.DataFrame:
+        if self.fit_result is None:
+            raise RuntimeError("OffDefNetRatingComponent must be fit before transform_rows")
+        return apply_offdef_features(rows, self.fit_result, home_id_col, away_id_col, neutral_site=neutral_site)
+
+    def predict_feature(self, game_row: pd.Series, home_id_col: str = "HomeID", away_id_col: str = "AwayID", neutral_site: bool = False) -> float:
+        if self.fit_result is None:
+            raise RuntimeError("OffDefNetRatingComponent must be fit before predict_feature")
+        h_id = int(game_row[home_id_col])
+        a_id = int(game_row[away_id_col])
+        h_off = float(self.fit_result.offense.get(h_id, 0.0))
+        a_off = float(self.fit_result.offense.get(a_id, 0.0))
+        h_def = float(self.fit_result.defense.get(h_id, 0.0))
+        a_def = float(self.fit_result.defense.get(a_id, 0.0))
+        neutral_margin = (self.fit_result.base_points + h_off - a_def) - (self.fit_result.base_points + a_off - h_def)
+        return float(neutral_margin + (0.0 if neutral_site else self.fit_result.home_adv_points))
