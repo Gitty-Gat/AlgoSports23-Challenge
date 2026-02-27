@@ -1,0 +1,38 @@
+{
+  "budget_info": {
+    "elapsed_seconds": 36.097418546676636,
+    "max_model_fits": 800,
+    "max_total_seconds": 900,
+    "model_fit_count": 375,
+    "stopped_on_model_fits": false,
+    "stopped_on_time": false
+  },
+  "cpu_count": 16,
+  "cwd": "C:\\algosports23\\AlgoSports23-Challenge",
+  "git_hash": "1aaa14e93a225970a75736c5fd1f73a703e08fc3",
+  "input_paths": {
+    "predictions_seed": "C:\\algosports23\\AlgoSports23-Challenge\\Submission.zip\\Predictions.csv",
+    "rankings_seed": "C:\\algosports23\\AlgoSports23-Challenge\\Submission.zip\\Rankings.xlsx",
+    "train": "C:\\algosports23\\AlgoSports23-Challenge\\Train.csv"
+  },
+  "machine": "AMD64",
+  "max_model_fits": 800,
+  "max_total_seconds": 900,
+  "n_jobs": 5,
+  "outer_fold_count": 5,
+  "platform": "Windows-10-10.0.19045-SP0",
+  "processor": "Intel64 Family 6 Model 167 Stepping 1, GenuineIntel",
+  "python": "3.13.0 (tags/v3.13.0:60403a5, Oct  7 2024, 09:38:07) [MSC v.1941 64 bit (AMD64)]",
+  "search_env": {
+    "ALGOSPORTS_MAX_MODEL_FITS": "800",
+    "ALGOSPORTS_MAX_TOTAL_SECONDS": "900",
+    "ALGOSPORTS_N_JOBS": "8"
+  },
+  "thread_env": {
+    "MKL_NUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1",
+    "OMP_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1"
+  },
+  "timestamp_utc": "2026-02-27T02:47:29.836702+00:00"
+}

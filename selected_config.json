@@ -1,0 +1,91 @@
+{
+  "derby_pred_distribution": {
+    "mean": -4.373452657739398,
+    "n": 75,
+    "p05": -51.31226850216705,
+    "p50": -3.5257195759182114,
+    "p95": 40.88380198654508,
+    "std": 26.904746835107705
+  },
+  "elok_secondary_only": true,
+  "feature_set": "F2",
+  "features": [
+    "massey_diff",
+    "elok_diff",
+    "games_played_diff",
+    "volatility_diff"
+  ],
+  "git_hash": "1aaa14e93a225970a75736c5fd1f73a703e08fc3",
+  "model_stage": {
+    "best_of_three_applied": true,
+    "best_of_three_feasible_count": 3,
+    "best_of_three_pool_count": 3,
+    "config_id": "massey_alpha=1.0|use_elo=1|elo_home_adv=60.0|elo_k=24.0|elo_decay_a=0.25|elo_decay_g=50.0||elasticnet|alpha=1.0|l1_ratio=0.12||module=expand_affine_global",
+    "gate_rejections_count": 55,
+    "lambda_cap_hit": 0.0,
+    "lambda_disp": 0.05,
+    "lambda_stability": 0.1,
+    "lambda_tail": 0.1,
+    "lambda_tbias": 0.0,
+    "lambda_tdisp": 0.05,
+    "lambda_xtail": 0.05,
+    "massey_gate_applied": false,
+    "massey_gate_reason": "",
+    "model_spec": {
+      "model_name": "elasticnet",
+      "params": {
+        "alpha": 1.0,
+        "l1_ratio": 0.12
+      }
+    },
+    "module": "expand_affine_global"
+  },
+  "oof_paths": {
+    "csv": "C:\\algosports23\\AlgoSports23-Challenge\\oof_predictions.csv",
+    "parquet": "C:\\algosports23\\AlgoSports23-Challenge\\oof_predictions.parquet"
+  },
+  "outer_fold_count": 5,
+  "postprocessor_fit": {
+    "affine": {
+      "a": -1.2424798975636318,
+      "a_star": 0.45915266436038316,
+      "eta": 0.7,
+      "fallback": false,
+      "n_oof": 746,
+      "naive_r": 2.0384159101649693,
+      "r_base": 0.49057701866105907,
+      "s": 1.4268911371154784,
+      "s_cap": 1.6,
+      "s_cap_hit": false,
+      "s_star": 1.0533373677158486,
+      "s_uncapped": 1.4268911371154784,
+      "underdispersed": true
+    },
+    "invalid": false,
+    "invalid_reason": "",
+    "module": "expand_affine_global",
+    "params": {}
+  },
+  "rating_stage": {
+    "config_id": "massey_alpha=1.0|use_elo=1|elo_home_adv=60.0|elo_k=24.0|elo_decay_a=0.25|elo_decay_g=50.0",
+    "lambda_cap_hit": 0.0,
+    "lambda_disp": 0.05,
+    "lambda_stability": 0.1,
+    "lambda_tail": 0.1,
+    "lambda_tbias": 0.0,
+    "lambda_tdisp": 0.05,
+    "lambda_xtail": 0.05,
+    "spec": {
+      "elo_decay_a": 0.25,
+      "elo_decay_g": 50.0,
+      "elo_home_adv": 60.0,
+      "elo_k": 24.0,
+      "massey_alpha": 1.0,
+      "use_elo": true
+    }
+  },
+  "runner_up_configs_path": "C:\\algosports23\\AlgoSports23-Challenge\\runner_up_configs.json",
+  "selected_at": "2026-02-27T02:47:29.836702+00:00",
+  "selection_lock": true,
+  "selection_score": "mean_rmse_w + lambda_tail*(mean_tail_rmse_w/mean_rmse_w) + lambda_xtail*(mean_xtail_rmse_w/mean_rmse_w) + lambda_disp*abs(log(mean_dispersion_ratio_w)) + lambda_cap_hit*s_cap_hit_rate + lambda_tbias*abs(mean_tail_bias_w) + lambda_tdisp*abs(log(mean_tail_dispersion_ratio_w)) + lambda_stability*std_rmse"
+}

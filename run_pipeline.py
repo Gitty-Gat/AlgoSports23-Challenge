@@ -1,25 +1,26 @@
 from __future__ import annotations
 
-import math
+import hashlib
+import json
 import os
-import random
-import textwrap
-import warnings
-from dataclasses import dataclass
+import platform
+import subprocess
+import sys
+import time
+from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence
+from textwrap import wrap
+from typing import Dict, List, Mapping, Sequence
 
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 import numpy as np
 import pandas as pd
-from scipy import stats
-from scipy.optimize import minimize
-from sklearn.ensemble import HistGradientBoostingRegressor
-from sklearn.linear_model import ElasticNet, HuberRegressor, Ridge
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
+from joblib import Parallel, delayed
 
 import matplotlib
 
@@ -28,1549 +29,1539 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
 from src.features import (
-    apply_static_models_to_derby_rows,
-    apply_static_models_to_train_like_rows,
-    assemble_model_table,
-    build_derby_sequential_features,
+    FoldFeatureArtifacts,
+    build_derby_table,
+    build_full_train_table,
+    build_fold_feature_tables,
     build_team_universe,
-    build_train_sequential_features,
-    fit_static_models_for_fold,
-    make_expanding_time_folds,
     parse_and_sort_train,
     parse_predictions,
+    make_expanding_time_folds,
 )
-from src.ratings import tune_home_advantage_elo
-from src.nextgen_pipeline import run_nextgen_pipeline
+from src.models import (
+    F1_FEATURES,
+    F2_FEATURES,
+    ModelSpec,
+    RatingSpec,
+    _get_xy,
+    aggregate_config_metrics,
+    apply_postprocessor,
+    apply_postprocessor_with_cv_guard,
+    build_inner_oof,
+    feature_cols_for_rating_spec,
+    fit_postprocessor,
+    generate_model_specs,
+    generate_rating_specs,
+    make_estimator,
+    regression_metrics,
+    select_with_1se_and_stability,
+    simplicity_rank,
+)
 
 
 SEED = 23
 ROOT = Path(__file__).resolve().parent
-BASE_MODELS = ["ridge", "elasticnet", "huber", "histgb"]
-MAPPING_VARIANTS = ["linear", "nonlinear"]
-META_EXCLUDE = {
-    "GameID",
-    "Date",
-    "HomeConf",
-    "HomeID",
-    "HomeTeam",
-    "HomePts",
-    "AwayConf",
-    "AwayID",
-    "AwayTeam",
-    "AwayPts",
-    "HomeWinMargin",
-    "Team1_Conf",
-    "Team1_ID",
-    "Team1",
-    "Team2_Conf",
-    "Team2_ID",
-    "Team2",
-    "Team1_WinMargin",
-}
 
 
-@dataclass
-class SweepResult:
-    fold_metrics: pd.DataFrame
-    config_summary: pd.DataFrame
-    oof_frame: pd.DataFrame
-
-
-@dataclass
-class EnsembleResult:
-    variant: str
-    base_pred_cols: List[str]
-    oof_raw_progressive: np.ndarray
-    oof_raw_global_weighted: np.ndarray
-    progressive_weights: pd.DataFrame
-    global_weights: np.ndarray
-
-
-def set_deterministic(seed: int = SEED) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
-
-
-def print_ls_la(root: Path) -> None:
-    print("ls -la")
-    for p in sorted(root.iterdir(), key=lambda x: x.name.lower()):
-        st = p.stat()
-        mode = "d" if p.is_dir() else "-"
-        mtime = pd.Timestamp(st.st_mtime, unit="s").strftime("%Y-%m-%d %H:%M:%S")
-        print(f"{mode} {st.st_size:12d} {mtime} {p.name}")
-
-
-def assert_required_files(root: Path) -> Dict[str, Path]:
-    required = {
-        "train": root / "Train.csv",
-        "pred": root / "Predictions.csv",
-        "rankings": root / "Rankings.xlsx",
-    }
-    for k, p in required.items():
-        if not p.exists():
-            raise FileNotFoundError(f"Missing required file: {k} -> {p}")
-    return required
-
-
-def load_inputs(paths: Mapping[str, Path]) -> Dict[str, pd.DataFrame]:
-    return {
-        "train": pd.read_csv(paths["train"]),
-        "pred": pd.read_csv(paths["pred"]),
-        "rankings": pd.read_excel(paths["rankings"]),
-    }
-
-
-def validate_team_coverage(team_universe: pd.DataFrame, train_df: pd.DataFrame, pred_df: pd.DataFrame) -> Dict[str, List[int]]:
-    known = set(team_universe["TeamID"].astype(int))
-    train_ids = set(train_df["HomeID"].astype(int)) | set(train_df["AwayID"].astype(int))
-    pred_ids = set(pred_df["Team1_ID"].astype(int)) | set(pred_df["Team2_ID"].astype(int))
-    return {
-        "missing_train": sorted(train_ids - known),
-        "missing_pred": sorted(pred_ids - known),
-    }
-
-
-def _share_time(total_sec: float, n_parts: int) -> float:
-    return float(total_sec) / max(int(n_parts), 1)
-
-
-def build_fold_datasets(
-    train_df: pd.DataFrame,
-    folds: List[dict],
-    seq_base: pd.DataFrame,
-    seq_plus: pd.DataFrame,
-    seq_minus: pd.DataFrame,
-    team_ids: List[int],
-    conf_values: List[str],
-    seq_build_times: Mapping[str, float],
-) -> tuple[list[dict], pd.DataFrame]:
-    fold_datasets: List[dict] = []
-    component_val_rows: List[pd.DataFrame] = []
-    seq_time_share = _share_time(sum(seq_build_times.values()), len(folds))
-
-    for fold in folds:
-        train_idx = fold["train_idx"]
-        val_idx = fold["val_idx"]
-        fit_games = train_df.loc[train_idx].copy()
-        train_rows = train_df.loc[train_idx].copy()
-        val_rows = train_df.loc[val_idx].copy()
-
-        static_models = fit_static_models_for_fold(fit_games, team_ids=team_ids, conf_values=conf_values)
-        train_static = apply_static_models_to_train_like_rows(train_rows, static_models, neutral_site=False)
-        val_static = apply_static_models_to_train_like_rows(val_rows, static_models, neutral_site=False)
-
-        train_tbl = assemble_model_table(train_rows, seq_base.loc[train_idx], train_static)
-        val_tbl = assemble_model_table(val_rows, seq_base.loc[val_idx], val_static)
-        train_tbl.index = train_rows.index
-        val_tbl.index = val_rows.index
-
-        train_tbl_plus = assemble_model_table(train_rows, seq_plus.loc[train_idx], train_static)
-        val_tbl_plus = assemble_model_table(val_rows, seq_plus.loc[val_idx], val_static)
-        train_tbl_minus = assemble_model_table(train_rows, seq_minus.loc[train_idx], train_static)
-        val_tbl_minus = assemble_model_table(val_rows, seq_minus.loc[val_idx], val_static)
-        train_tbl_plus.index = train_rows.index
-        val_tbl_plus.index = val_rows.index
-        train_tbl_minus.index = train_rows.index
-        val_tbl_minus.index = val_rows.index
-
-        for tbl in [train_tbl, val_tbl, train_tbl_plus, val_tbl_plus, train_tbl_minus, val_tbl_minus]:
-            if "Date" in tbl.columns:
-                tbl["Date"] = pd.to_datetime(tbl["Date"])
-
-        fold_datasets.append(
-            {
-                "fold": fold["fold"],
-                "train": train_tbl,
-                "val": val_tbl,
-                "train_plus": train_tbl_plus,
-                "val_plus": val_tbl_plus,
-                "train_minus": train_tbl_minus,
-                "val_minus": val_tbl_minus,
-                "feature_build_time_sec": float(seq_time_share),
-                "fold_meta": fold,
-            }
-        )
-
-        comp = val_tbl[["elo_diff_pre", "massey_diff", "offdef_net_diff", "HomeWinMargin"]].copy()
-        comp["fold"] = fold["fold"]
-        comp["row_index"] = comp.index
-        component_val_rows.append(comp.reset_index(drop=True))
-
-    comp_df = pd.concat(component_val_rows, ignore_index=True) if component_val_rows else pd.DataFrame()
-    return fold_datasets, comp_df
-
-
-def build_full_train_and_derby_tables(
-    train_df: pd.DataFrame,
-    pred_df: pd.DataFrame,
-    seq_full_train: pd.DataFrame,
-    seq_derby: pd.DataFrame,
-    team_ids: List[int],
-    conf_values: List[str],
-):
-    static_models_full = fit_static_models_for_fold(train_df, team_ids=team_ids, conf_values=conf_values)
-    train_static_full = apply_static_models_to_train_like_rows(train_df, static_models_full, neutral_site=False)
-    pred_static = apply_static_models_to_derby_rows(pred_df, static_models_full)
-    train_tbl_full = assemble_model_table(train_df, seq_full_train, train_static_full)
-    derby_tbl = assemble_model_table(pred_df, seq_derby, pred_static)
-    train_tbl_full.index = train_df.index
-    derby_tbl.index = pred_df.index
-    if "Date" in train_tbl_full.columns:
-        train_tbl_full["Date"] = pd.to_datetime(train_tbl_full["Date"])
-    if "Date" in derby_tbl.columns:
-        derby_tbl["Date"] = pd.to_datetime(derby_tbl["Date"])
-    return train_tbl_full, derby_tbl, static_models_full, train_static_full, pred_static
-
-
-def compute_ranking_weights_from_oof(component_oof: pd.DataFrame) -> Dict[str, float]:
-    cols = ["elo_diff_pre", "massey_diff", "offdef_net_diff"]
-    X = component_oof[cols].astype(float)
-    y = component_oof["HomeWinMargin"].astype(float).to_numpy()
-    model = Pipeline([("scaler", StandardScaler()), ("ridge", Ridge(alpha=2.0, random_state=SEED))])
-    model.fit(X, y)
-    coef = np.abs(np.asarray(model.named_steps["ridge"].coef_, dtype=float))
-    if coef.sum() <= 0:
-        coef = np.ones_like(coef)
-    coef = coef / coef.sum()
-    return {"elo": float(coef[0]), "massey": float(coef[1]), "net": float(coef[2])}
-
-
-def zscore_series(s: pd.Series) -> pd.Series:
-    s = s.astype(float)
-    sd = float(s.std(ddof=0))
-    if not math.isfinite(sd) or sd == 0:
-        return pd.Series(np.zeros(len(s)), index=s.index, dtype=float)
-    return (s - float(s.mean())) / sd
-
-
-def build_rankings_output(
-    rankings_df: pd.DataFrame,
-    team_universe: pd.DataFrame,
-    final_elo: Mapping[int, float],
-    final_massey: Mapping[int, float],
-    final_net: Mapping[int, float],
-    weights: Mapping[str, float],
-) -> pd.DataFrame:
-    out = rankings_df.copy()
-    out["TeamID"] = out["TeamID"].astype(int)
-    out = out.merge(team_universe.rename(columns={"Team": "Team_universe"}), on="TeamID", how="left")
-    elo_s = out["TeamID"].map(final_elo).fillna(1500.0).astype(float)
-    massey_s = out["TeamID"].map(final_massey).fillna(0.0).astype(float)
-    net_s = out["TeamID"].map(final_net).fillna(0.0).astype(float)
-    out["_elo_z"] = zscore_series(elo_s)
-    out["_massey_z"] = zscore_series(massey_s)
-    out["_net_z"] = zscore_series(net_s)
-    out["_score"] = (
-        float(weights["elo"]) * out["_elo_z"]
-        + float(weights["massey"]) * out["_massey_z"]
-        + float(weights["net"]) * out["_net_z"]
-    )
-    out = out.sort_values(["_score", "TeamID"], ascending=[False, True], kind="mergesort").reset_index(drop=True)
-    out["Rank"] = np.arange(1, len(out) + 1, dtype=int)
-    out = out.sort_values("TeamID", kind="mergesort").reset_index(drop=True)
-    out["Rank"] = out["Rank"].astype(int)
-    out = out.drop(columns=[c for c in out.columns if c.startswith("_") or c == "Team_universe"])
-    return out
-
-
-def _rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    return float(np.sqrt(np.mean((np.asarray(y_true) - np.asarray(y_pred)) ** 2)))
-
-
-def _mae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    return float(np.mean(np.abs(np.asarray(y_true) - np.asarray(y_pred))))
-
-
-def _bias(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    return float(np.mean(np.asarray(y_pred) - np.asarray(y_true)))
-
-
-def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
-    resid = np.asarray(y_true, dtype=float) - np.asarray(y_pred, dtype=float)
-    resid_sd = float(np.std(resid, ddof=0))
-    outlier_freq = 0.0 if resid_sd <= 1e-12 else float(np.mean(np.abs(resid) > 2.5 * resid_sd))
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return int(default)
     try:
-        skew = float(stats.skew(resid, bias=False))
+        return int(raw)
     except Exception:
-        skew = float("nan")
+        return int(default)
+
+
+_CPU_COUNT = os.cpu_count() or 8
+N_JOBS = max(1, _env_int("ALGOSPORTS_N_JOBS", min(8, max(1, _CPU_COUNT - 2))))
+MAX_MODEL_FITS = max(1, _env_int("ALGOSPORTS_MAX_MODEL_FITS", 800))
+MAX_TOTAL_SECONDS = max(60, _env_int("ALGOSPORTS_MAX_TOTAL_SECONDS", 900))
+LAMBDA_TAIL_GRID = [0.10, 0.20]
+LAMBDA_XTAIL_GRID = [0.05, 0.10]
+LAMBDA_DISP_GRID = [0.05, 0.10, 0.20]
+LAMBDA_TDISP_GRID = [0.05, 0.10]
+LAMBDA_STABILITY_GRID = [0.10, 0.20]
+LAMBDA_CAP_HIT_GRID = [0.0, 0.05, 0.10]
+LAMBDA_TBIAS_GRID = [0.0, 0.002, 0.005]
+POSTPROCESS_MODULES = [
+    "none",
+    "expand_affine_global",
+    "expand_regime_affine_v2",
+    "expand_regime_affine_v2_heterosk",
+    "expand_piecewise_tail_v2",
+]
+BASELINE_DISPERSION_RATIO_REFERENCE = 43.62 / 26.15
+
+
+def _resolve_input_path(candidates: Sequence[Path], label: str) -> Path:
+    for p in candidates:
+        if p.exists():
+            return p
+    joined = ", ".join(str(x) for x in candidates)
+    raise FileNotFoundError(f"Missing {label}. Tried: {joined}")
+
+
+def _git_hash() -> str:
     try:
-        kurt = float(stats.kurtosis(resid, fisher=True, bias=False))
+        return (
+            subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(ROOT), stderr=subprocess.DEVNULL)
+            .decode("utf-8")
+            .strip()
+        )
     except Exception:
-        kurt = float("nan")
-    return {
-        "rmse": _rmse(y_true, y_pred),
-        "mae": _mae(y_true, y_pred),
-        "bias": _bias(y_true, y_pred),
-        "resid_skew": skew,
-        "resid_kurtosis": kurt,
-        "outlier_freq_2p5sd": outlier_freq,
-        "pred_mean": float(np.mean(y_pred)),
-        "pred_std": float(np.std(y_pred)),
-    }
+        return "unknown"
 
 
-def make_estimator(model_name: str, seed: int = SEED):
-    m = model_name.lower()
-    if m == "ridge":
-        return Pipeline([("scaler", StandardScaler()), ("model", Ridge(alpha=8.0, random_state=seed))])
-    if m == "elasticnet":
-        return Pipeline(
-            [
-                ("scaler", StandardScaler()),
-                ("model", ElasticNet(alpha=0.05, l1_ratio=0.2, max_iter=30000, random_state=seed)),
-            ]
-        )
-    if m == "huber":
-        return Pipeline(
-            [
-                ("scaler", StandardScaler()),
-                ("model", HuberRegressor(alpha=0.001, epsilon=1.35, max_iter=1000)),
-            ]
-        )
-    if m == "histgb":
-        return HistGradientBoostingRegressor(
-            loss="squared_error",
-            learning_rate=0.05,
-            max_depth=4,
-            max_leaf_nodes=31,
-            min_samples_leaf=8,
-            l2_regularization=0.8,
-            max_iter=400,
-            early_stopping=False,
-            random_state=seed,
-        )
-    raise ValueError(f"Unknown model {model_name}")
+def _json_dump(path: Path, obj: Mapping) -> None:
+    path.write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def add_nonlinear_features(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    poly_cols = [
-        "elo_diff_pre",
-        "massey_diff",
-        "offdef_net_diff",
-        "offdef_margin_neutral",
-        "ema_margin_diff",
-        "mean_margin_diff",
-        "oppadj_margin_diff",
-        "conf_strength_diff",
-    ]
-    for col in poly_cols:
-        if col not in out.columns:
-            continue
-        x = out[col].astype(float)
-        z = x / 50.0
-        out[f"{col}__sq"] = z * z
-        out[f"{col}__cu"] = z * z * z
-        out[f"{col}__abs"] = np.abs(z)
-
-    for col, knots in [
-        ("elo_diff_pre", [-120, -80, -40, 0, 40, 80, 120]),
-        ("massey_diff", [-80, -40, -20, 0, 20, 40, 80]),
-        ("offdef_net_diff", [-60, -30, -10, 0, 10, 30, 60]),
-    ]:
-        if col not in out.columns:
-            continue
-        x = out[col].astype(float).to_numpy()
-        abs_x = np.abs(x)
-        abs_bins = [0, 10, 20, 40, 60, 100, np.inf]
-        for lo, hi in zip(abs_bins[:-1], abs_bins[1:]):
-            name = f"{col}__absbin_{int(lo)}_{'inf' if not np.isfinite(hi) else int(hi)}"
-            out[name] = ((abs_x >= lo) & (abs_x < hi)).astype(float)
-        for k in knots:
-            out[f"{col}__hinge_gt_{k}"] = np.maximum(x - float(k), 0.0) / 50.0
-            out[f"{col}__hinge_lt_{k}"] = np.maximum(float(k) - x, 0.0) / 50.0
-    return out
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            b = f.read(1 << 20)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
 
 
-def select_feature_columns(df: pd.DataFrame) -> List[str]:
-    cols: List[str] = []
-    for c in df.columns:
-        if c in META_EXCLUDE:
-            continue
-        if pd.api.types.is_numeric_dtype(df[c]):
-            cols.append(c)
-    return sorted(cols)
+def _zscore(x: pd.Series) -> pd.Series:
+    x = x.astype(float)
+    sd = float(x.std(ddof=0))
+    if sd <= 1e-12 or not np.isfinite(sd):
+        return pd.Series(np.zeros(len(x)), index=x.index, dtype=float)
+    return (x - float(x.mean())) / sd
 
 
-def _xy(df: pd.DataFrame, feature_cols: Sequence[str], target_col: str = "HomeWinMargin") -> tuple[pd.DataFrame, np.ndarray]:
-    X = df.reindex(columns=list(feature_cols), fill_value=0.0).astype(float)
-    y = df[target_col].to_numpy(dtype=float)
-    return X, y
-
-
-def evaluate_base_models(
-    train_df: pd.DataFrame,
-    fold_datasets: Sequence[Mapping[str, object]],
-    feature_cols_by_variant: Mapping[str, Sequence[str]],
-) -> SweepResult:
-    y_all = train_df["HomeWinMargin"].to_numpy(dtype=float)
-    fold_id_by_row = np.full(len(train_df), -1, dtype=int)
-    for fold in fold_datasets:
-        fold_id_by_row[np.asarray(fold["fold_meta"]["val_idx"], dtype=int)] = int(fold["fold"])
-    valid_mask_all = fold_id_by_row > 0
-    if valid_mask_all.sum() == 0:
-        raise RuntimeError("No validation-covered rows found in time-aware folds.")
-
-    oof_frame = pd.DataFrame(
-        {
-            "row_index": np.arange(len(train_df))[valid_mask_all],
-            "fold": fold_id_by_row[valid_mask_all],
-            "y_true": y_all[valid_mask_all],
-        }
-    )
-    fold_rows: List[dict] = []
-
-    for variant in MAPPING_VARIANTS:
-        feature_cols = list(feature_cols_by_variant[variant])
-        for model_name in BASE_MODELS:
-            config_name = f"{model_name}__{variant}"
-            pred_col = f"pred__{config_name}"
-            oof_pred = np.full(len(train_df), np.nan, dtype=float)
-
-            for fd in fold_datasets:
-                fold_id = int(fd["fold"])
-                train_tbl = fd["train_aug"][variant]
-                val_tbl = fd["val_aug"][variant]
-                X_train, y_train = _xy(train_tbl, feature_cols)
-                X_val, y_val = _xy(val_tbl, feature_cols)
-                est = make_estimator(model_name, seed=SEED)
-                est.fit(X_train, y_train)
-                y_hat = np.asarray(est.predict(X_val), dtype=float)
-                oof_pred[val_tbl.index.to_numpy(dtype=int)] = y_hat
-                met = regression_metrics(y_val, y_hat)
-                fold_rows.append(
-                    {
-                        "config_name": config_name,
-                        "model_name": model_name,
-                        "mapping": variant,
-                        "fold": fold_id,
-                        "rmse": met["rmse"],
-                        "mae": met["mae"],
-                        "bias": met["bias"],
-                        "resid_skew": met["resid_skew"],
-                        "resid_kurtosis": met["resid_kurtosis"],
-                        "outlier_freq_2p5sd": met["outlier_freq_2p5sd"],
-                        "n_features": len(feature_cols),
-                    }
-                )
-
-            if np.isnan(oof_pred[valid_mask_all]).any():
-                raise RuntimeError(f"Missing OOF predictions for {config_name}")
-            oof_frame[pred_col] = oof_pred[valid_mask_all]
-
-    oof_frame["rating_diff"] = train_df.get("elo_diff_pre", pd.Series(np.zeros(len(train_df)))).astype(float).to_numpy()[valid_mask_all]
-    oof_frame["rating_diff_abs"] = np.abs(oof_frame["rating_diff"].astype(float))
-
-    fold_metrics = pd.DataFrame(fold_rows)
-    summary = (
-        fold_metrics.groupby(["config_name", "model_name", "mapping"], as_index=False)
-        .agg(
-            rmse_mean=("rmse", "mean"),
-            rmse_std=("rmse", "std"),
-            mae_mean=("mae", "mean"),
-            mae_std=("mae", "std"),
-            bias_mean=("bias", "mean"),
-            bias_abs_mean=("bias", lambda s: float(np.mean(np.abs(s)))),
-            resid_skew_mean=("resid_skew", "mean"),
-            resid_kurtosis_mean=("resid_kurtosis", "mean"),
-            outlier_freq_2p5sd_mean=("outlier_freq_2p5sd", "mean"),
-            n_features=("n_features", "max"),
-            n_folds=("fold", "count"),
-        )
-        .sort_values(["rmse_mean", "mae_mean", "rmse_std"], kind="mergesort")
-        .reset_index(drop=True)
-    )
-    glob_rows = []
-    for _, r in summary.iterrows():
-        pred_col = f"pred__{r['config_name']}"
-        met = regression_metrics(oof_frame["y_true"].to_numpy(dtype=float), oof_frame[pred_col].to_numpy(dtype=float))
-        glob_rows.append(
-            {
-                "config_name": r["config_name"],
-                "rmse_oof": met["rmse"],
-                "mae_oof": met["mae"],
-                "bias_oof": met["bias"],
-                "resid_skew_oof": met["resid_skew"],
-                "resid_kurtosis_oof": met["resid_kurtosis"],
-                "outlier_freq_2p5sd_oof": met["outlier_freq_2p5sd"],
-            }
-        )
-    summary = summary.merge(pd.DataFrame(glob_rows), on="config_name", how="left")
-    summary = summary.sort_values(["rmse_mean", "mae_mean", "rmse_std"], kind="mergesort").reset_index(drop=True)
-    return SweepResult(fold_metrics=fold_metrics, config_summary=summary, oof_frame=oof_frame)
-
-
-def _normalize_simplex(w: np.ndarray) -> np.ndarray:
-    w = np.asarray(w, dtype=float).copy()
-    w[~np.isfinite(w)] = 0.0
-    w = np.clip(w, 0.0, None)
-    s = float(w.sum())
-    return np.full_like(w, 1.0 / len(w)) if s <= 0 else w / s
-
-
-def optimize_simplex_weights(Z: np.ndarray, y: np.ndarray, init: Optional[np.ndarray] = None) -> np.ndarray:
-    Z = np.asarray(Z, dtype=float)
-    y = np.asarray(y, dtype=float)
-    n = Z.shape[1]
-    init = _normalize_simplex(np.full(n, 1.0 / n) if init is None else np.asarray(init, dtype=float))
-
-    def obj(w: np.ndarray) -> float:
-        resid = y - Z.dot(np.asarray(w, dtype=float))
-        return float(np.mean(resid**2))
-
-    constraints = [{"type": "eq", "fun": lambda w: float(np.sum(w) - 1.0)}]
-    bounds = [(0.0, 1.0)] * n
-    res = minimize(obj, x0=init, method="SLSQP", bounds=bounds, constraints=constraints, options={"maxiter": 300, "ftol": 1e-12})
-    if res.success and np.isfinite(res.fun):
-        return _normalize_simplex(res.x)
-
-    # Deterministic fallback: test one-hot and equal weights, choose lowest MSE.
-    candidates = [init, np.full(n, 1.0 / n)]
-    for i in range(n):
-        e = np.zeros(n, dtype=float)
-        e[i] = 1.0
-        candidates.append(e)
-    best_w = init
-    best_obj = float("inf")
-    for w in candidates:
-        val = obj(_normalize_simplex(w))
-        if val < best_obj:
-            best_obj = val
-            best_w = _normalize_simplex(w)
-    return best_w
-
-
-def build_ensemble_from_oof(oof_frame: pd.DataFrame, variant: str) -> EnsembleResult:
-    base_pred_cols = [f"pred__{m}__{variant}" for m in BASE_MODELS]
-    df = oof_frame.sort_values(["fold", "row_index"], kind="mergesort").reset_index(drop=False).rename(columns={"index": "_orig_idx"})
-    y_all = df["y_true"].to_numpy(dtype=float)
-    Z_all = df[base_pred_cols].to_numpy(dtype=float)
-    global_weights = optimize_simplex_weights(Z_all, y_all)
-    oof_raw_global_weighted = Z_all.dot(global_weights)
-
-    progressive_raw = np.zeros(len(df), dtype=float)
-    rows: List[dict] = []
-    fold_array = df["fold"].to_numpy(dtype=int)
-    for fold_id in sorted(np.unique(fold_array).tolist()):
-        val_mask = fold_array == fold_id
-        prior_mask = fold_array < fold_id
-        if prior_mask.sum() >= len(BASE_MODELS) * 5:
-            w = optimize_simplex_weights(Z_all[prior_mask], y_all[prior_mask], init=global_weights)
-            source = "prior_folds"
-        else:
-            w = np.full(len(BASE_MODELS), 1.0 / len(BASE_MODELS))
-            source = "uniform_warm_start"
-        progressive_raw[val_mask] = Z_all[val_mask].dot(w)
-        row = {"fold": int(fold_id), "source": source}
-        for i, m in enumerate(BASE_MODELS):
-            row[f"w_{m}"] = float(w[i])
-        rows.append(row)
-
-    prog_orig = np.zeros(len(df), dtype=float)
-    glob_orig = np.zeros(len(df), dtype=float)
-    idx_orig = df["_orig_idx"].to_numpy(dtype=int)
-    prog_orig[idx_orig] = progressive_raw
-    glob_orig[idx_orig] = oof_raw_global_weighted
-    return EnsembleResult(
-        variant=variant,
-        base_pred_cols=base_pred_cols,
-        oof_raw_progressive=prog_orig,
-        oof_raw_global_weighted=glob_orig,
-        progressive_weights=pd.DataFrame(rows),
-        global_weights=global_weights,
-    )
-
-
-def fit_linear_calibration(pred: np.ndarray, y: np.ndarray) -> tuple[float, float]:
-    pred = np.asarray(pred, dtype=float)
-    y = np.asarray(y, dtype=float)
-    if len(pred) < 2 or np.std(pred) < 1e-9:
-        return 0.0, 1.0
-    X = np.column_stack([np.ones(len(pred)), pred])
-    coef, *_ = np.linalg.lstsq(X, y, rcond=None)
-    a, b = float(coef[0]), float(coef[1])
-    if not np.isfinite(a):
-        a = 0.0
-    if not np.isfinite(b):
-        b = 1.0
-    return a, b
-
-
-def progressive_calibration(oof_frame: pd.DataFrame, raw_pred: np.ndarray) -> tuple[np.ndarray, pd.DataFrame, tuple[float, float]]:
-    df = oof_frame[["row_index", "fold", "y_true"]].copy()
-    df["raw_pred"] = np.asarray(raw_pred, dtype=float)
-    df = df.sort_values(["fold", "row_index"], kind="mergesort").reset_index(drop=False).rename(columns={"index": "_orig_idx"})
-    y_all = df["y_true"].to_numpy(dtype=float)
-    p_all = df["raw_pred"].to_numpy(dtype=float)
-
-    cal = np.zeros(len(df), dtype=float)
-    rows: List[dict] = []
-    fold_arr = df["fold"].to_numpy(dtype=int)
-    for fold_id in sorted(np.unique(fold_arr).tolist()):
-        val_mask = fold_arr == fold_id
-        prior_mask = fold_arr < fold_id
-        if prior_mask.sum() >= 30:
-            a, b = fit_linear_calibration(p_all[prior_mask], y_all[prior_mask])
-            source = "prior_folds"
-        else:
-            a, b = 0.0, 1.0
-            source = "identity_warm_start"
-        cal[val_mask] = a + b * p_all[val_mask]
-        rows.append({"fold": int(fold_id), "intercept_a": float(a), "slope_b": float(b), "source": source})
-
-    cal_orig = np.zeros(len(df), dtype=float)
-    cal_orig[df["_orig_idx"].to_numpy(dtype=int)] = cal
-    global_params = fit_linear_calibration(np.asarray(raw_pred, dtype=float), oof_frame["y_true"].to_numpy(dtype=float))
-    return cal_orig, pd.DataFrame(rows), global_params
-
-
-def fit_variance_model_linear(x_abs: np.ndarray, sq_resid: np.ndarray) -> tuple[float, float]:
-    x_abs = np.asarray(x_abs, dtype=float)
-    sq_resid = np.asarray(sq_resid, dtype=float)
-    if len(x_abs) < 2:
-        base = float(np.mean(sq_resid)) if len(sq_resid) else 100.0
-        return max(base, 1.0), 0.0
-    X = np.column_stack([np.ones(len(x_abs)), x_abs])
-    coef, *_ = np.linalg.lstsq(X, sq_resid, rcond=None)
-    a, b = float(coef[0]), float(coef[1])
-    if not np.isfinite(a):
-        a = float(np.mean(sq_resid))
-    if not np.isfinite(b):
-        b = 0.0
-    return max(a, 1.0), max(b, 0.0)
-
-
-def predict_variance_linear(x_abs: np.ndarray, params: tuple[float, float], floor_var: float = 9.0) -> np.ndarray:
-    a, b = params
-    var = a + b * np.asarray(x_abs, dtype=float)
-    return np.clip(var, floor_var, None)
-
-
-def progressive_variance_estimation(
-    oof_frame: pd.DataFrame,
-    pred_for_resid: np.ndarray,
-    warm_var: Optional[float] = None,
-) -> tuple[np.ndarray, np.ndarray, pd.DataFrame, tuple[float, float]]:
-    df = oof_frame[["row_index", "fold", "y_true", "rating_diff_abs"]].copy()
-    df["pred"] = np.asarray(pred_for_resid, dtype=float)
-    df = df.sort_values(["fold", "row_index"], kind="mergesort").reset_index(drop=False).rename(columns={"index": "_orig_idx"})
-    resid_all = df["y_true"].to_numpy(dtype=float) - df["pred"].to_numpy(dtype=float)
-    x_all = df["rating_diff_abs"].to_numpy(dtype=float)
-    default_var = float(np.var(df["y_true"].to_numpy(dtype=float)))
-    if warm_var is not None and np.isfinite(warm_var) and warm_var > 0:
-        default_var = float(warm_var)
-    if not np.isfinite(default_var) or default_var <= 0:
-        default_var = 100.0
-
-    var_hat = np.zeros(len(df), dtype=float)
-    rows: List[dict] = []
-    fold_arr = df["fold"].to_numpy(dtype=int)
-    for fold_id in sorted(np.unique(fold_arr).tolist()):
-        val_mask = fold_arr == fold_id
-        prior_mask = fold_arr < fold_id
-        if prior_mask.sum() >= 40:
-            params = fit_variance_model_linear(x_all[prior_mask], resid_all[prior_mask] ** 2)
-            source = "prior_folds"
-        else:
-            params = (default_var, 0.0)
-            source = "constant_warm_start"
-        var_hat[val_mask] = predict_variance_linear(x_all[val_mask], params, floor_var=max(default_var * 0.02, 9.0))
-        rows.append({"fold": int(fold_id), "var_intercept": float(params[0]), "var_slope": float(params[1]), "source": source})
-
-    var_orig = np.zeros(len(df), dtype=float)
-    var_orig[df["_orig_idx"].to_numpy(dtype=int)] = var_hat
-    global_params = fit_variance_model_linear(oof_frame["rating_diff_abs"].to_numpy(dtype=float), (oof_frame["y_true"].to_numpy(dtype=float) - np.asarray(pred_for_resid, dtype=float)) ** 2)
-    sd_orig = np.sqrt(np.clip(var_orig, 1e-9, None))
-    return var_orig, sd_orig, pd.DataFrame(rows), global_params
-
-
-def compute_shrink_factor(var_hat: np.ndarray, lambda_shrink: float, var_ref: float) -> np.ndarray:
-    var_ref = float(max(var_ref, 1e-6))
-    sf = 1.0 / (1.0 + float(lambda_shrink) * (np.asarray(var_hat, dtype=float) / var_ref))
-    return np.clip(sf, 0.45, 1.0)
-
-
-def simulate_trimmed_mean(means: np.ndarray, sds: np.ndarray, seed: int, n_draws: int = 2000, trim_frac: float = 0.05) -> np.ndarray:
-    means = np.asarray(means, dtype=float)
-    sds = np.asarray(sds, dtype=float)
-    rng = np.random.default_rng(seed)
-    z = rng.standard_normal((len(means), n_draws))
-    sims = means[:, None] + sds[:, None] * z
-    sims.sort(axis=1)
-    lo = int(round(n_draws * trim_frac))
-    hi = int(round(n_draws * (1.0 - trim_frac)))
-    lo = max(lo, 0)
-    hi = min(max(hi, lo + 1), n_draws)
-    return sims[:, lo:hi].mean(axis=1)
-
-
-def choose_shrink_lambda(y_true: np.ndarray, calibrated_pred: np.ndarray, var_hat: np.ndarray, sd_hat: np.ndarray) -> tuple[float, pd.DataFrame, Dict[str, np.ndarray]]:
-    y_true = np.asarray(y_true, dtype=float)
-    calibrated_pred = np.asarray(calibrated_pred, dtype=float)
-    var_hat = np.asarray(var_hat, dtype=float)
-    sd_hat = np.asarray(sd_hat, dtype=float)
-    var_ref = float(np.median(var_hat[np.isfinite(var_hat)])) if np.isfinite(var_hat).any() else 1.0
-    var_ref = max(var_ref, 1.0)
-    rows: List[dict] = []
-    for lam in np.linspace(0.0, 1.5, 31):
-        sf = compute_shrink_factor(var_hat, float(lam), var_ref)
-        shrunk = calibrated_pred * sf
-        sim = simulate_trimmed_mean(shrunk, sd_hat, seed=SEED + 900 + int(round(lam * 1000)))
-        rows.append(
-            {
-                "lambda_shrink": float(lam),
-                "rmse_shrunk": _rmse(y_true, shrunk),
-                "mae_shrunk": _mae(y_true, shrunk),
-                "rmse_sim_trimmed": _rmse(y_true, sim),
-                "mae_sim_trimmed": _mae(y_true, sim),
-                "shrink_mean": float(np.mean(sf)),
-                "shrink_min": float(np.min(sf)),
-            }
-        )
-    grid = pd.DataFrame(rows).sort_values(["rmse_sim_trimmed", "mae_sim_trimmed", "lambda_shrink"], kind="mergesort").reset_index(drop=True)
-    return float(grid.iloc[0]["lambda_shrink"]), grid, {"var_ref": np.array([var_ref])}
-
-
-def apply_postprocessing_stack(
-    raw_pred: np.ndarray,
-    rating_diff_abs: np.ndarray,
-    calib_params: tuple[float, float],
-    var_params: tuple[float, float],
-    lambda_shrink: float,
-    var_ref: float,
-    sim_seed: int,
-) -> Dict[str, np.ndarray]:
-    raw_pred = np.asarray(raw_pred, dtype=float)
-    a, b = calib_params
-    calibrated = a + b * raw_pred
-    var_hat = predict_variance_linear(np.asarray(rating_diff_abs, dtype=float), var_params)
-    sd_hat = np.sqrt(np.clip(var_hat, 1e-9, None))
-    sf = compute_shrink_factor(var_hat, lambda_shrink=lambda_shrink, var_ref=var_ref)
-    shrunk = calibrated * sf
-    sim_trim = simulate_trimmed_mean(shrunk, sd_hat, seed=sim_seed)
-    return {
-        "raw": raw_pred,
-        "calibrated": calibrated,
-        "var_hat": var_hat,
-        "sd_hat": sd_hat,
-        "shrink_factor": sf,
-        "shrunk": shrunk,
-        "sim_trimmed": sim_trim,
-    }
-
-
-def augment_fold_and_full_tables(fold_datasets: Sequence[dict], full_train_tbl: pd.DataFrame, derby_tbl: pd.DataFrame) -> tuple[list[dict], dict]:
-    out_folds: List[dict] = []
-    for fd in fold_datasets:
-        fd2 = dict(fd)
-        fd2["train_aug"] = {"linear": fd["train"], "nonlinear": add_nonlinear_features(fd["train"])}
-        fd2["val_aug"] = {"linear": fd["val"], "nonlinear": add_nonlinear_features(fd["val"])}
-        fd2["train_plus_aug"] = {"linear": fd["train_plus"], "nonlinear": add_nonlinear_features(fd["train_plus"])}
-        fd2["val_plus_aug"] = {"linear": fd["val_plus"], "nonlinear": add_nonlinear_features(fd["val_plus"])}
-        fd2["train_minus_aug"] = {"linear": fd["train_minus"], "nonlinear": add_nonlinear_features(fd["train_minus"])}
-        fd2["val_minus_aug"] = {"linear": fd["val_minus"], "nonlinear": add_nonlinear_features(fd["val_minus"])}
-        out_folds.append(fd2)
-    full_aug = {
-        "train": {"linear": full_train_tbl, "nonlinear": add_nonlinear_features(full_train_tbl)},
-        "derby": {"linear": derby_tbl, "nonlinear": add_nonlinear_features(derby_tbl)},
-    }
-    return out_folds, full_aug
-
-
-def fit_full_base_models_and_predict(train_tbl: pd.DataFrame, pred_tbl: pd.DataFrame, feature_cols: Sequence[str]) -> Dict[str, np.ndarray]:
-    X_train, y_train = _xy(train_tbl, feature_cols)
-    X_pred = pred_tbl.reindex(columns=list(feature_cols), fill_value=0.0).astype(float)
-    out: Dict[str, np.ndarray] = {}
-    for model_name in BASE_MODELS:
-        est = make_estimator(model_name, seed=SEED)
-        est.fit(X_train, y_train)
-        out[model_name] = np.asarray(est.predict(X_pred), dtype=float)
-    return out
-
-
-def summarize_mapping_comparison(config_summary: pd.DataFrame) -> pd.DataFrame:
-    rows = []
-    for mapping in MAPPING_VARIANTS:
-        sub = config_summary[config_summary["mapping"] == mapping].sort_values(["rmse_mean", "mae_mean"], kind="mergesort")
-        if sub.empty:
-            continue
-        best = sub.iloc[0]
-        rows.append(
-            {
-                "mapping": mapping,
-                "best_config": str(best["config_name"]),
-                "rmse_mean": float(best["rmse_mean"]),
-                "mae_mean": float(best["mae_mean"]),
-                "bias_mean": float(best["bias_mean"]),
-                "n_features": int(best["n_features"]),
-            }
-        )
-    out = pd.DataFrame(rows)
-    if len(out) == 2 and (out["mapping"] == "linear").any():
-        lin_rmse = float(out.loc[out["mapping"] == "linear", "rmse_mean"].iloc[0])
-        out["rmse_delta_vs_linear"] = out["rmse_mean"] - lin_rmse
-        if (out["mapping"] == "nonlinear").any():
-            nl_rmse = float(out.loc[out["mapping"] == "nonlinear", "rmse_mean"].iloc[0])
-            out["nonlinear_improves"] = bool(nl_rmse < lin_rmse)
-    return out
-
-
-def build_stage_metrics_table(y_true: np.ndarray, stages: Mapping[str, np.ndarray]) -> pd.DataFrame:
-    rows = []
-    for name, pred in stages.items():
-        m = regression_metrics(y_true, pred)
-        rows.append(
-            {
-                "stage": name,
-                "rmse": m["rmse"],
-                "mae": m["mae"],
-                "bias": m["bias"],
-                "resid_skew": m["resid_skew"],
-                "resid_kurtosis": m["resid_kurtosis"],
-                "outlier_freq_2p5sd": m["outlier_freq_2p5sd"],
-            }
-        )
-    return pd.DataFrame(rows).sort_values(["rmse", "mae"], kind="mergesort").reset_index(drop=True)
-
-
-def format_df_for_text(df: pd.DataFrame, max_rows: int = 20, width: int = 140) -> str:
-    if df is None or df.empty:
-        return "(empty)"
-    use = df.head(max_rows).copy()
-    txt = use.to_string(index=False)
+def _wrap_lines(text: str, width: int = 120) -> List[str]:
     lines: List[str] = []
-    for line in txt.splitlines():
+    for line in text.splitlines():
         if len(line) <= width:
             lines.append(line)
         else:
-            lines.extend(textwrap.wrap(line, width=width, break_long_words=False, replace_whitespace=False))
-    if len(df) > max_rows:
-        lines.append(f"... ({len(df) - max_rows} more rows)")
-    return "\n".join(lines)
+            lines.extend(wrap(line, width=width, break_long_words=False, replace_whitespace=False))
+    return lines
 
 
-def _new_text_page(pdf: PdfPages, title: str, lines: List[str], footer: Optional[str] = None) -> None:
+def _add_text_page(pdf: PdfPages, title: str, lines: Sequence[str]) -> None:
     fig = plt.figure(figsize=(8.5, 11))
     ax = fig.add_axes([0, 0, 1, 1])
     ax.axis("off")
-    fig.text(0.05, 0.97, title, fontsize=16, fontweight="bold", va="top")
+    fig.text(0.04, 0.97, title, fontsize=13, fontweight="bold", va="top")
     y = 0.94
     for line in lines:
-        if y < 0.05:
+        if y < 0.04:
             pdf.savefig(fig, bbox_inches="tight")
             plt.close(fig)
             fig = plt.figure(figsize=(8.5, 11))
             ax = fig.add_axes([0, 0, 1, 1])
             ax.axis("off")
-            fig.text(0.05, 0.97, f"{title} (cont.)", fontsize=16, fontweight="bold", va="top")
+            fig.text(0.04, 0.97, f"{title} (cont.)", fontsize=13, fontweight="bold", va="top")
             y = 0.94
-        fig.text(0.05, y, line, fontsize=9, va="top", family="monospace")
-        y -= 0.018
-    if footer:
-        fig.text(0.05, 0.02, footer, fontsize=8, va="bottom")
+        fig.text(0.04, y, line, fontsize=8.5, family="monospace", va="top")
+        y -= 0.017
     pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
 
 
-def _page_with_table(pdf: PdfPages, title: str, df: pd.DataFrame, max_rows_per_page: int = 28, float_fmt: str = "{:.3f}") -> None:
-    if df is None or df.empty:
-        _new_text_page(pdf, title, ["(empty)"])
-        return
-    n_pages = int(math.ceil(len(df) / max_rows_per_page))
-    for i in range(n_pages):
-        chunk = df.iloc[i * max_rows_per_page : (i + 1) * max_rows_per_page].copy()
-        disp = chunk.copy()
-        for c in disp.columns:
-            if pd.api.types.is_float_dtype(disp[c]):
-                disp[c] = disp[c].map(lambda x: "" if pd.isna(x) else float_fmt.format(float(x)))
-        fig, ax = plt.subplots(figsize=(11, 8.5))
-        ax.axis("off")
-        ax.set_title(f"{title} ({i + 1}/{n_pages})", fontsize=12, fontweight="bold", pad=12)
-        tbl = ax.table(cellText=disp.values, colLabels=[str(c) for c in disp.columns], loc="center", cellLoc="center", colLoc="center")
-        tbl.auto_set_font_size(False)
-        tbl.set_fontsize(7)
-        tbl.scale(1, 1.2)
-        pdf.savefig(fig, bbox_inches="tight")
-        plt.close(fig)
+def _df_text(df: pd.DataFrame, max_rows: int = 40) -> str:
+    if df.empty:
+        return "(empty)"
+    use = df.head(max_rows).copy()
+    txt = use.to_string(index=False)
+    if len(df) > max_rows:
+        txt += f"\n... ({len(df) - max_rows} more rows)"
+    return txt
 
 
-def build_final_report_pdf(
+def _time_exceeded(run_start_ts: float) -> bool:
+    return (time.time() - float(run_start_ts)) > float(MAX_TOTAL_SECONDS)
+
+
+def _evaluate_rating_fold(train_df: pd.DataFrame, fold: Mapping, rating_spec: RatingSpec, team_ids: Sequence[int]) -> dict:
+    feature_set_name, feature_cols = feature_cols_for_rating_spec(rating_spec)
+    train_rows = train_df.loc[np.asarray(fold["train_idx"], dtype=int)].copy()
+    val_rows = train_df.loc[np.asarray(fold["val_idx"], dtype=int)].copy()
+    art: FoldFeatureArtifacts = build_fold_feature_tables(
+        train_rows,
+        val_rows,
+        team_ids=team_ids,
+        massey_alpha=rating_spec.massey_alpha,
+        use_elo=rating_spec.use_elo,
+        elo_home_adv=rating_spec.elo_home_adv,
+        elo_k=rating_spec.elo_k,
+        elo_decay_a=rating_spec.elo_decay_a,
+        elo_decay_g=rating_spec.elo_decay_g,
+    )
+    fixed_model = ModelSpec("ridge", {"alpha": 10.0})
+    X_tr, y_tr = _get_xy(art.train_table, feature_cols=feature_cols)
+    X_va, y_va = _get_xy(art.val_table, feature_cols=feature_cols)
+    est = make_estimator(fixed_model, seed=SEED)
+    est.fit(X_tr, y_tr)
+    p_base = np.asarray(est.predict(X_va), dtype=float)
+
+    inner_oof = build_inner_oof(
+        train_rows,
+        team_ids=team_ids,
+        rating_spec=rating_spec,
+        model_spec=fixed_model,
+        feature_cols=feature_cols,
+    )
+    post_fit = fit_postprocessor("expand_affine_global", inner_oof)
+    gp_min = np.minimum(
+        art.val_table["games_played_home"].to_numpy(dtype=float),
+        art.val_table["games_played_away"].to_numpy(dtype=float),
+    )
+    mismatch_key = np.abs(art.val_table["d_key"].to_numpy(dtype=float))
+    info_key = gp_min.copy()
+    if bool(post_fit.get("invalid", False)):
+        p_final = p_base.copy()
+        invalid_post = True
+        cv_disp_ratio = float(np.std(p_final, ddof=0) / max(np.std(y_va, ddof=0), 1e-9))
+        cv_disp_guard_reject = False
+    else:
+        post_applied = apply_postprocessor_with_cv_guard(
+            post_fit,
+            y_pred_base=p_base,
+            d_key=art.val_table["d_key"].to_numpy(dtype=float),
+            gp_min=gp_min,
+            y_true=y_va,
+            max_disp_ratio=None,
+        )
+        p_final = np.asarray(post_applied["y_pred_final"], dtype=float)
+        cv_disp_ratio = float(post_applied.get("cv_dispersion_ratio", np.nan))
+        cv_disp_guard_reject = bool(post_applied.get("cv_dispersion_guard_reject", False))
+        invalid_post = bool(cv_disp_guard_reject)
+
+    met = regression_metrics(y_va, p_final)
+    aff = post_fit.get("affine", {})
+    return {
+        "config_id": rating_spec.key,
+        "fold": int(fold["fold"]),
+        "rmse": met["rmse"],
+        "mae": met["mae"],
+        "tail_rmse": met["tail_rmse"],
+        "xtail_rmse": met["xtail_rmse"],
+        "dispersion_ratio": met["dispersion_ratio"],
+        "tail_dispersion_ratio": met["tail_dispersion_ratio"],
+        "bias": met["bias"],
+        "tail_bias": met["tail_bias"],
+        "max_abs_pred": float(np.max(np.abs(p_final))) if len(p_final) else 0.0,
+        "simplicity_rank": 1 if rating_spec.use_elo else 0,
+        "use_elo": int(rating_spec.use_elo),
+        "feature_set": feature_set_name,
+        "massey_alpha": float(rating_spec.massey_alpha),
+        "elo_home_adv": float(rating_spec.elo_home_adv),
+        "elo_decay_a": float(rating_spec.elo_decay_a),
+        "elo_decay_g": float(rating_spec.elo_decay_g),
+        "invalid_postprocess": int(invalid_post),
+        "r_base": float(aff.get("r_base", np.nan)),
+        "naive_r": float(aff.get("naive_r", np.nan)),
+        "s_star": float(aff.get("s_star", np.nan)),
+        "chosen_s": float(aff.get("s", np.nan)),
+        "eta": float(aff.get("eta")) if aff.get("eta") is not None else np.nan,
+        "s_cap_hit": int(bool(aff.get("s_cap_hit", False))),
+        "cv_dispersion_ratio": cv_disp_ratio,
+        "cv_disp_guard_reject": int(cv_disp_guard_reject),
+        "mismatch_key_mean": float(np.mean(mismatch_key)),
+        "info_key_mean": float(np.mean(info_key)),
+    }
+
+
+def _evaluate_model_fold(
+    train_df: pd.DataFrame,
+    fold: Mapping,
+    rating_spec: RatingSpec,
+    model_spec: ModelSpec,
+    module_name: str,
+    team_ids: Sequence[int],
+) -> tuple[dict, pd.DataFrame]:
+    feature_set_name, feature_cols = feature_cols_for_rating_spec(rating_spec)
+    train_rows = train_df.loc[np.asarray(fold["train_idx"], dtype=int)].copy()
+    val_rows = train_df.loc[np.asarray(fold["val_idx"], dtype=int)].copy()
+
+    art = build_fold_feature_tables(
+        train_rows,
+        val_rows,
+        team_ids=team_ids,
+        massey_alpha=rating_spec.massey_alpha,
+        use_elo=rating_spec.use_elo,
+        elo_home_adv=rating_spec.elo_home_adv,
+        elo_k=rating_spec.elo_k,
+        elo_decay_a=rating_spec.elo_decay_a,
+        elo_decay_g=rating_spec.elo_decay_g,
+    )
+
+    X_tr, y_tr = _get_xy(art.train_table, feature_cols=feature_cols)
+    X_va, y_va = _get_xy(art.val_table, feature_cols=feature_cols)
+    est = make_estimator(model_spec, seed=SEED)
+    est.fit(X_tr, y_tr)
+    p_base = np.asarray(est.predict(X_va), dtype=float)
+
+    inner_oof = build_inner_oof(train_rows, team_ids=team_ids, rating_spec=rating_spec, model_spec=model_spec, feature_cols=feature_cols)
+    post_fit = fit_postprocessor(module_name, inner_oof)
+
+    gp_min = np.minimum(
+        art.val_table["games_played_home"].to_numpy(dtype=float),
+        art.val_table["games_played_away"].to_numpy(dtype=float),
+    )
+    mismatch_key = np.abs(art.val_table["d_key"].to_numpy(dtype=float))
+    info_key = gp_min.copy()
+    if bool(post_fit.get("invalid", False)):
+        p_final = p_base.copy()
+        regime_ids = np.full(len(p_base), "invalid", dtype=object)
+        s_used = np.full(len(p_base), np.nan, dtype=float)
+        t_used = np.full(len(p_base), np.nan, dtype=float)
+        k_used = np.full(len(p_base), np.nan, dtype=float)
+        eta_used = np.full(len(p_base), np.nan, dtype=float)
+        invalid_postprocess = True
+        cv_disp_ratio = float(np.std(p_final, ddof=0) / max(np.std(y_va, ddof=0), 1e-9))
+        cv_disp_guard_reject = False
+    else:
+        post_applied = apply_postprocessor_with_cv_guard(
+            post_fit,
+            y_pred_base=p_base,
+            d_key=art.val_table["d_key"].to_numpy(dtype=float),
+            gp_min=gp_min,
+            y_true=y_va,
+            max_disp_ratio=None,
+        )
+        p_final = np.asarray(post_applied["y_pred_final"], dtype=float)
+        regime_ids = np.asarray(post_applied["regime_id"], dtype=object)
+        s_used = np.asarray(post_applied["postprocess_s_used"], dtype=float)
+        t_used = np.asarray(post_applied["postprocess_t_used"], dtype=float)
+        k_used = np.asarray(post_applied["postprocess_k_used"], dtype=float)
+        eta_used = np.asarray(post_applied["postprocess_eta_used"], dtype=float)
+        cv_disp_ratio = float(post_applied.get("cv_dispersion_ratio", np.nan))
+        cv_disp_guard_reject = bool(post_applied.get("cv_dispersion_guard_reject", False))
+        invalid_postprocess = bool(cv_disp_guard_reject)
+
+    met_base = regression_metrics(y_va, p_base)
+    met_final = regression_metrics(y_va, p_final)
+    aff = post_fit.get("affine", {})
+    par = post_fit.get("params", {})
+    reg = par.get("regimes", {})
+    blow_s = [float(v.get("s", np.nan)) for k, v in reg.items() if str(k).startswith("blowout|")] if isinstance(reg, dict) else []
+    blowout_mean_s = float(np.mean(blow_s)) if len(blow_s) else np.nan
+
+    metric_row = {
+        "config_id": f"{rating_spec.key}||{model_spec.key}||module={module_name}",
+        "rating_config_id": rating_spec.key,
+        "model_config_id": model_spec.key,
+        "module": module_name,
+        "feature_set": feature_set_name,
+        "fold": int(fold["fold"]),
+        "rmse": met_final["rmse"],
+        "mae": met_final["mae"],
+        "tail_rmse": met_final["tail_rmse"],
+        "xtail_rmse": met_final["xtail_rmse"],
+        "dispersion_ratio": met_final["dispersion_ratio"],
+        "tail_dispersion_ratio": met_final["tail_dispersion_ratio"],
+        "bias": met_final["bias"],
+        "tail_bias": met_final["tail_bias"],
+        "max_abs_pred": float(np.max(np.abs(p_final))) if len(p_final) else 0.0,
+        "base_rmse": met_base["rmse"],
+        "base_tail_rmse": met_base["tail_rmse"],
+        "base_xtail_rmse": met_base["xtail_rmse"],
+        "base_tail_dispersion_ratio": met_base["tail_dispersion_ratio"],
+        "simplicity_rank": simplicity_rank(rating_spec.use_elo, model_spec.model_name, module_name),
+        "model_name": model_spec.model_name,
+        "massey_alpha": rating_spec.massey_alpha,
+        "use_elo": int(rating_spec.use_elo),
+        "elo_home_adv": rating_spec.elo_home_adv,
+        "elo_decay_a": rating_spec.elo_decay_a,
+        "elo_decay_g": rating_spec.elo_decay_g,
+        "affine_a": float(aff.get("a", 0.0)),
+        "affine_s": float(aff.get("s", 1.0)),
+        "affine_naive_r": float(aff.get("naive_r", np.nan)),
+        "affine_r_base": float(aff.get("r_base", np.nan)),
+        "affine_s_star": float(aff.get("s_star", np.nan)),
+        "affine_eta": float(aff.get("eta")) if aff.get("eta") is not None else np.nan,
+        "s_cap_hit": int(bool(aff.get("s_cap_hit", False))),
+        "cv_dispersion_ratio": cv_disp_ratio,
+        "cv_disp_guard_reject": int(cv_disp_guard_reject),
+        "blowout_mean_s": blowout_mean_s,
+        "tail_t": float(par.get("tail_t", np.nan)),
+        "tail_k": float(par.get("tail_k", np.nan)),
+        "tail_q": float(par.get("tail_q", np.nan)),
+        "invalid_postprocess": int(invalid_postprocess),
+        "invalid_reason": "cv_dispersion_guard_fail" if cv_disp_guard_reject else str(post_fit.get("invalid_reason", "")),
+    }
+
+    fold_pred = art.val_table[["GameID", "Date", "HomeID", "AwayID", "HomeWinMargin"]].copy()
+    fold_pred = fold_pred.rename(columns={"HomeWinMargin": "y_true"})
+    fold_pred["y_pred_base"] = p_base
+    fold_pred["y_pred_final"] = p_final
+    fold_pred["fold_id"] = int(fold["fold"])
+    fold_pred["regime_id"] = pd.Series(regime_ids, index=fold_pred.index).astype(str)
+    fold_pred["mismatch_key"] = mismatch_key
+    fold_pred["info_key"] = info_key
+    fold_pred["postprocess_s_used"] = s_used
+    fold_pred["postprocess_t_used"] = t_used
+    fold_pred["postprocess_k_used"] = k_used
+    fold_pred["postprocess_eta_used"] = eta_used
+    return metric_row, fold_pred
+
+
+def _select_rating_config(
+    train_df: pd.DataFrame,
+    folds: Sequence[Mapping],
+    team_ids: Sequence[int],
+    *,
+    run_start_ts: float,
+) -> tuple[RatingSpec, pd.DataFrame, dict]:
+    rating_specs = generate_rating_specs()
+    registry = {spec.key: spec for spec in rating_specs}
+    fold_rows: List[dict] = []
+
+    for i, spec in enumerate(rating_specs, start=1):
+        if _time_exceeded(run_start_ts):
+            print(f"[rating-stage] time budget reached at {i-1}/{len(rating_specs)} specs")
+            break
+        rows: List[dict] = []
+        for fold in folds:
+            r = _evaluate_rating_fold(train_df, fold, spec, team_ids)
+            rows.append(r)
+            if float(r.get("rmse", np.nan)) > 60.0:
+                break
+        fold_rows.extend(rows)
+        if i % 50 == 0 or i == len(rating_specs):
+            print(f"[rating-stage] evaluated {i}/{len(rating_specs)} rating configs")
+
+    fold_df = pd.DataFrame(fold_rows)
+    summary = aggregate_config_metrics(fold_df)
+    selection = select_with_1se_and_stability(
+        summary,
+        lambda_tail_values=LAMBDA_TAIL_GRID,
+        lambda_xtail_values=LAMBDA_XTAIL_GRID,
+        lambda_disp_values=LAMBDA_DISP_GRID,
+        lambda_cap_hit_values=LAMBDA_CAP_HIT_GRID,
+        lambda_tbias_values=LAMBDA_TBIAS_GRID,
+        lambda_tdisp_values=LAMBDA_TDISP_GRID,
+        lambda_stability_values=LAMBDA_STABILITY_GRID,
+    )
+    selected_id = str(selection["selected_config_id"])
+    selected_spec = registry[selected_id]
+    return selected_spec, fold_df, selection
+
+
+def _evaluate_model_stage(
+    train_df: pd.DataFrame,
+    folds: Sequence[Mapping],
+    team_ids: Sequence[int],
+    rating_spec: RatingSpec,
+    *,
+    run_start_ts: float,
+) -> tuple[pd.DataFrame, dict, dict]:
+    model_specs = generate_model_specs()
+    feature_set_name, _ = feature_cols_for_rating_spec(rating_spec)
+    registry: Dict[str, dict] = {}
+    metric_rows: List[dict] = []
+    model_fit_count = 0
+    stopped_on_time = False
+    stopped_on_fits = False
+
+    for i, model_spec in enumerate(model_specs, start=1):
+        if _time_exceeded(run_start_ts):
+            stopped_on_time = True
+            break
+        for module in POSTPROCESS_MODULES:
+            if _time_exceeded(run_start_ts):
+                stopped_on_time = True
+                break
+            if model_fit_count >= MAX_MODEL_FITS:
+                stopped_on_fits = True
+                break
+            config_id = f"{rating_spec.key}||{model_spec.key}||module={module}"
+            registry[config_id] = {
+                "rating_spec": asdict(rating_spec),
+                "model_spec": {"model_name": model_spec.model_name, "params": dict(model_spec.params)},
+                "module": module,
+                "feature_set": feature_set_name,
+            }
+            for fold in folds:
+                met, _pred = _evaluate_model_fold(train_df, fold, rating_spec, model_spec, module, team_ids)
+                metric_rows.append(met)
+                model_fit_count += 1
+                if float(met.get("rmse", np.nan)) > 60.0:
+                    break
+                if model_fit_count >= MAX_MODEL_FITS or _time_exceeded(run_start_ts):
+                    break
+        if stopped_on_time or stopped_on_fits:
+            break
+        print(f"[model-stage] completed {i}/{len(model_specs)} model families (with module grid)")
+
+    metrics_df = pd.DataFrame(metric_rows)
+    budget_info = {
+        "model_fit_count": int(model_fit_count),
+        "max_model_fits": int(MAX_MODEL_FITS),
+        "max_total_seconds": int(MAX_TOTAL_SECONDS),
+        "stopped_on_time": bool(stopped_on_time),
+        "stopped_on_model_fits": bool(stopped_on_fits),
+        "elapsed_seconds": float(time.time() - float(run_start_ts)),
+    }
+    return metrics_df, registry, budget_info
+
+
+def _rerun_selected_for_oof(
+    train_df: pd.DataFrame,
+    folds: Sequence[Mapping],
+    team_ids: Sequence[int],
+    rating_spec: RatingSpec,
+    model_spec: ModelSpec,
+    module_name: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    fold_results = Parallel(n_jobs=min(N_JOBS, len(folds)), prefer="processes")(
+        delayed(_evaluate_model_fold)(train_df, fold, rating_spec, model_spec, module_name, team_ids) for fold in folds
+    )
+    met_rows = [x[0] for x in fold_results]
+    pred_rows = [x[1] for x in fold_results]
+    metrics_df = pd.DataFrame(met_rows)
+    oof_df = pd.concat(pred_rows, axis=0, ignore_index=True)
+    oof_df = oof_df.sort_values(["Date", "GameID"], kind="mergesort").reset_index(drop=True)
+    return metrics_df, oof_df
+
+
+def _late_fold_diagnostics(metrics_df: pd.DataFrame, oof_df: pd.DataFrame) -> dict:
+    folds = sorted(metrics_df["fold"].astype(int).unique().tolist()) if not metrics_df.empty else []
+    late_folds = folds[-2:] if len(folds) >= 2 else folds
+    if not late_folds:
+        return {
+            "late_folds": [],
+            "late_n_games": 0,
+            "late_rmse": float("nan"),
+            "late_mae": float("nan"),
+            "late_tail_rmse": float("nan"),
+            "late_dispersion_ratio": float("nan"),
+            "late_tail_dispersion_ratio": float("nan"),
+            "late_bias": float("nan"),
+            "late_tail_bias": float("nan"),
+        }
+    late_oof = oof_df[oof_df["fold_id"].astype(int).isin(late_folds)].copy()
+    met = regression_metrics(
+        late_oof["y_true"].to_numpy(dtype=float),
+        late_oof["y_pred_final"].to_numpy(dtype=float),
+    )
+    return {
+        "late_folds": [int(x) for x in late_folds],
+        "late_n_games": int(len(late_oof)),
+        "late_rmse": float(met["rmse"]),
+        "late_mae": float(met["mae"]),
+        "late_tail_rmse": float(met["tail_rmse"]),
+        "late_dispersion_ratio": float(met["dispersion_ratio"]),
+        "late_tail_dispersion_ratio": float(met["tail_dispersion_ratio"]),
+        "late_bias": float(met["bias"]),
+        "late_tail_bias": float(met["tail_bias"]),
+    }
+
+
+def _parse_selected_config(registry: Mapping[str, dict], selected_config_id: str) -> tuple[RatingSpec, ModelSpec, str]:
+    cfg = registry[selected_config_id]
+    rs = cfg["rating_spec"]
+    ms = cfg["model_spec"]
+    rating_spec = RatingSpec(
+        massey_alpha=float(rs["massey_alpha"]),
+        use_elo=bool(rs["use_elo"]),
+        elo_home_adv=float(rs["elo_home_adv"]),
+        elo_k=float(rs["elo_k"]),
+        elo_decay_a=float(rs["elo_decay_a"]),
+        elo_decay_g=float(rs["elo_decay_g"]),
+    )
+    model_spec = ModelSpec(model_name=str(ms["model_name"]), params={k: float(v) for k, v in ms["params"].items()})
+    module = str(cfg["module"])
+    return rating_spec, model_spec, module
+
+
+def _enforce_massey_only_gate(model_fold_metrics: pd.DataFrame, model_summary: pd.DataFrame, selected_config_id: str) -> tuple[str, dict]:
+    gate_info = {
+        "applied": False,
+        "reason": "",
+        "all_fold_winners_massey_only": False,
+    }
+    if model_fold_metrics.empty or model_summary.empty:
+        return selected_config_id, gate_info
+
+    fold_winners = (
+        model_fold_metrics.sort_values(["fold", "rmse", "tail_rmse"], kind="mergesort")
+        .groupby("fold", as_index=False)
+        .first()
+    )
+    all_massey_only = bool((fold_winners["use_elo"].astype(int) == 0).all())
+    gate_info["all_fold_winners_massey_only"] = all_massey_only
+    if not all_massey_only:
+        return selected_config_id, gate_info
+
+    sel_rows = model_summary[model_summary["config_id"] == selected_config_id]
+    if sel_rows.empty:
+        return selected_config_id, gate_info
+    selected_use_elo = int(sel_rows.iloc[0]["use_elo"])
+    if selected_use_elo == 0:
+        return selected_config_id, gate_info
+
+    candidates = model_summary[model_summary["use_elo"].astype(int) == 0].copy()
+    if candidates.empty:
+        return selected_config_id, gate_info
+    candidates = candidates.sort_values(
+        ["mean_rmse", "mean_tail_rmse", "std_rmse", "mean_mae", "simplicity_rank"],
+        kind="mergesort",
+    ).reset_index(drop=True)
+    override_id = str(candidates.iloc[0]["config_id"])
+    gate_info["applied"] = True
+    gate_info["reason"] = "All per-fold winners were massey-only; overriding to best massey-only config."
+    return override_id, gate_info
+
+
+def _build_rankings_output(rankings_input: pd.DataFrame, massey_map: Mapping[int, float], elo_map: Mapping[int, float], use_elo: bool) -> pd.DataFrame:
+    out = rankings_input[["TeamID", "Team"]].copy()
+    out["TeamID"] = out["TeamID"].astype(int)
+    out["Team"] = out["Team"].astype(str)
+    out["massey"] = out["TeamID"].map(massey_map).fillna(0.0).astype(float)
+    out["elo"] = out["TeamID"].map(elo_map).fillna(1500.0).astype(float)
+    out["massey_z"] = _zscore(out["massey"])
+    out["elo_z"] = _zscore(out["elo"])
+    out["score"] = out["massey_z"] + (0.20 if use_elo else 0.0) * out["elo_z"]
+    out = out.sort_values(["score", "TeamID"], ascending=[False, True], kind="mergesort").reset_index(drop=True)
+    out["Rank"] = np.arange(1, len(out) + 1, dtype=int)
+    out = out[["TeamID", "Team", "Rank"]].sort_values("TeamID", kind="mergesort").reset_index(drop=True)
+    return out
+
+
+def _build_pdf_report(
     out_path: Path,
     *,
-    train_df: pd.DataFrame,
-    pred_input: pd.DataFrame,
-    folds: Sequence[dict],
-    best_home_adv: int,
-    home_adv_detail: pd.DataFrame,
-    feature_cols_by_variant: Mapping[str, Sequence[str]],
-    sweep: SweepResult,
-    mapping_comparison: pd.DataFrame,
-    ensemble_linear: EnsembleResult,
-    ensemble_nonlinear: EnsembleResult,
-    ensemble_comparison: pd.DataFrame,
-    calibration_fold_df: pd.DataFrame,
-    calibration_global: tuple[float, float],
-    variance_fold_df: pd.DataFrame,
-    variance_global: tuple[float, float],
-    shrink_grid: pd.DataFrame,
-    lambda_shrink: float,
-    var_ref: float,
-    stage_metrics: pd.DataFrame,
-    heavy_tail_compare: pd.DataFrame,
-    oof_frame: pd.DataFrame,
-    oof_stages: Mapping[str, np.ndarray],
-    final_derby_stage: Mapping[str, np.ndarray],
-    final_pred_int: np.ndarray,
-    home_adv_sensitivity: pd.DataFrame,
-    weight_perturb_summary: pd.DataFrame,
-    rankings_out: pd.DataFrame,
-    ranking_weights: Mapping[str, float],
-    component_oof_weights: Mapping[str, float],
-    note_reportlab_missing: bool,
+    git_hash: str,
+    timestamp_utc: str,
+    selected_config_digest: str,
+    selected_config: Mapping,
+    selection_lock_info: Mapping,
+    folds: Sequence[Mapping],
+    rating_summary: pd.DataFrame,
+    model_summary: pd.DataFrame,
+    selected_outer_metrics: pd.DataFrame,
+    oof_df: pd.DataFrame,
+    run_metadata_path: Path,
+    selected_config_path: Path,
 ) -> None:
-    y_true = oof_frame["y_true"].to_numpy(dtype=float)
-    pred_input_dates = pd.to_datetime(pred_input["Date"])
-    final_oof_pred = np.asarray(oof_stages["sim_trimmed"], dtype=float)
-    final_resid = y_true - final_oof_pred
-    raw_ens = np.asarray(oof_stages["ensemble_raw_progressive"], dtype=float)
-    cal_ens = np.asarray(oof_stages["calibrated_progressive"], dtype=float)
-    rating_abs = oof_frame["rating_diff_abs"].to_numpy(dtype=float)
-
     with PdfPages(out_path) as pdf:
-        if note_reportlab_missing:
-            _new_text_page(
-                pdf,
-                "Environment Note",
-                [
-                    "reportlab package is not installed in this environment.",
-                    "PDF generated with matplotlib PdfPages fallback (same required content included).",
-                ],
-            )
-
-        prior_rmse = 279.39
-        best_stage = stage_metrics.sort_values(["rmse", "mae"], kind="mergesort").iloc[0]
-        _new_text_page(
+        _add_text_page(
             pdf,
-            "Executive Summary",
+            "Rocketball Derby Final Report",
             [
-                "1. Executive summary",
-                "- Objective metric: RMSE on margin prediction (primary). MAE is secondary.",
-                f"- Prior stated RMSE baseline: {prior_rmse:.2f}",
-                f"- Best time-aware CV stage RMSE: {float(best_stage['rmse']):.3f}",
-                f"- Improvement vs prior baseline: {prior_rmse - float(best_stage['rmse']):.3f}",
-                "- Final derby output uses nonlinear mapping + constrained ensemble + calibration + uncertainty-aware shrinkage.",
+                f"Timestamp (UTC): {timestamp_utc}",
+                f"Git hash: {git_hash}",
+                f"Run metadata: {run_metadata_path}",
+                f"Selected config path: {selected_config_path}",
+                f"Selected config sha256: {selected_config_digest}",
+                f"Rating summary rows: {len(rating_summary)}",
+                f"Model summary rows: {len(model_summary)}",
+                f"Selected outer-metric rows: {len(selected_outer_metrics)}",
                 "",
-                "2. Data constraints (home vs neutral, no derby labels)",
-                f"- Train games: {len(train_df)} ({train_df['Date'].min().date()} to {train_df['Date'].max().date()})",
-                f"- Derby games: {len(pred_input)} on {pred_input_dates.min().date()}",
-                "- No derby labels available. Validation uses chronological expanding folds of Train.csv only.",
-                "- Derby predictions are neutral-site (home advantage set to 0 in derby feature generation).",
+                "Selection lock",
+                "- Outer CV determines winning pipeline; full-train performs refit-only of locked choices.",
+                "- No re-selection at full train stage.",
+                "- Selection score: mean_rmse_w + lambda_tail*(mean_tail_rmse_w/mean_rmse_w) + lambda_xtail*(mean_xtail_rmse_w/mean_rmse_w) + lambda_disp*|log(disp_ratio_w)| + lambda_cap_hit*s_cap_hit_rate + lambda_tbias*|tail_bias_w| + lambda_tdisp*|log(tail_disp_ratio_w)| + lambda_stability*std_rmse.",
                 "",
-                "3. Feature engineering",
-                "- Pregame-only sequential Elo, Massey, off/def net, strength of schedule, EMA margin, rest/volatility retained.",
-                f"- Elo HOME_ADV tuned via time-aware CV: {best_home_adv} Elo points.",
-                f"- Feature counts: linear={len(feature_cols_by_variant['linear'])}, nonlinear={len(feature_cols_by_variant['nonlinear'])}.",
-                "- Nonlinear mapping implemented with polynomial + piecewise hinge/bin transforms of rating differentials.",
-            ],
+                "Selected config (locked)",
+            ]
+            + _wrap_lines(json.dumps(selected_config, indent=2), width=100),
         )
 
-        fold_lines = ["Chronological folds:"]
-        for f in folds:
-            fold_lines.append(
-                f" fold={f['fold']} train_n={len(f['train_idx'])} val_n={len(f['val_idx'])} "
-                f"train_end={pd.Timestamp(f['train_end_date']).date()} "
-                f"val={pd.Timestamp(f['val_start_date']).date()}..{pd.Timestamp(f['val_end_date']).date()}"
-            )
-        ha_summary = (
-            home_adv_detail[home_adv_detail["fold"] >= 0]
-            .groupby("home_adv", as_index=False)
-            .agg(brier_mean=("brier", "mean"), brier_std=("brier", "std"), logloss_mean=("logloss", "mean"))
-            .sort_values(["brier_mean", "brier_std", "home_adv"], kind="mergesort")
-        )
-        fold_lines.extend(["", "HOME_ADV tuning summary:", format_df_for_text(ha_summary, max_rows=20, width=130)])
-        _new_text_page(pdf, "Validation Design", fold_lines)
-
-        model_cols = [
-            "config_name",
-            "model_name",
-            "mapping",
-            "rmse_mean",
-            "mae_mean",
-            "bias_mean",
-            "rmse_std",
-            "resid_skew_oof",
-            "resid_kurtosis_oof",
-            "outlier_freq_2p5sd_oof",
-        ]
-        _page_with_table(pdf, "4. Model comparison table (all configs, CV metrics)", sweep.config_summary[model_cols].copy(), max_rows_per_page=24)
-
-        _new_text_page(
-            pdf,
-            "Modeling Highlights",
-            [
-                "4. Model comparison summary",
-                "Selection rule: lowest CV RMSE first, MAE second.",
-                "",
-                "Nonlinear mapping comparison:",
-                format_df_for_text(mapping_comparison, max_rows=10, width=130),
-                "",
-                "7. Ensemble weighting results (linear vs nonlinear)",
-                format_df_for_text(ensemble_comparison, max_rows=10, width=130),
-                "",
-                "Final nonlinear global ensemble weights (simplex constrained):",
-                f" Ridge={ensemble_nonlinear.global_weights[0]:.4f}",
-                f" ElasticNet={ensemble_nonlinear.global_weights[1]:.4f}",
-                f" Huber={ensemble_nonlinear.global_weights[2]:.4f}",
-                f" HistGB={ensemble_nonlinear.global_weights[3]:.4f}",
-            ],
-        )
-        _page_with_table(pdf, "7. Ensemble weighting results - nonlinear progressive fold weights", ensemble_nonlinear.progressive_weights, max_rows_per_page=20)
-
-        cal_avg_slope = float(calibration_fold_df["slope_b"].mean())
-        cal_avg_intercept = float(calibration_fold_df["intercept_a"].mean())
-        cal_interp = "overconfident" if cal_avg_slope < 1.0 else "underconfident" if cal_avg_slope > 1.0 else "well-calibrated"
-        _new_text_page(
-            pdf,
-            "Calibration and Variance",
-            [
-                "5. Calibration analysis",
-                "- Fold calibration regression: actual = a + b * predicted (progressive prior-fold fit).",
-                f"- Global calibration for final derby: a={calibration_global[0]:.4f}, b={calibration_global[1]:.4f}",
-                f"- Average fold slope b={cal_avg_slope:.4f}, average intercept a={cal_avg_intercept:.4f}",
-                f"- Interpretation: average slope implies raw ensemble is {cal_interp}.",
-                f"- Calibration RMSE effect: raw={_rmse(y_true, raw_ens):.3f} -> calibrated={_rmse(y_true, cal_ens):.3f}",
-                "",
-                "6. Variance modeling",
-                "- squared_residual ~ |rating_diff| (using |elo_diff_pre|; nonnegative slope enforced).",
-                f"- Global variance model: var = {variance_global[0]:.4f} + {variance_global[1]:.6f} * |rating_diff|",
-                f"- Shrink lambda selected by OOF RMSE of simulated trimmed mean: {lambda_shrink:.3f}",
-                f"- Variance reference scale for shrinking: {var_ref:.3f}",
-                "",
-                "8. Uncertainty-aware prediction",
-                "- Per-fold residual SD estimated from variance model.",
-                "- 2000 Normal draws per game, 5% trimmed mean candidate prediction.",
-                "- Compared raw, calibrated, variance-shrunk, simulated-trimmed stages via OOF RMSE.",
-            ],
-        )
-        _page_with_table(pdf, "5. Calibration fold slopes/intercepts", calibration_fold_df, max_rows_per_page=20)
-        _page_with_table(pdf, "6. Variance model fold parameters", variance_fold_df, max_rows_per_page=20)
-        _page_with_table(pdf, "8. Shrink lambda sweep and simulation RMSE", shrink_grid, max_rows_per_page=24)
-        _page_with_table(pdf, "Stage comparison (OOF)", stage_metrics, max_rows_per_page=20)
-
-        _new_text_page(
-            pdf,
-            "Robust Regression",
-            [
-                "6. Robust regression / heavy tail control",
-                "- Explicitly compared Ridge (L2) and Huber (robust loss) on nonlinear feature mapping.",
-                "- Residual skewness, kurtosis, and outlier frequency reported below.",
-                "",
-                format_df_for_text(heavy_tail_compare, max_rows=10, width=130),
-                "",
-                "11. Key decisions & rationale",
-                "- RMSE is the governing selection criterion for configs and downstream stack comparisons.",
-                "- Simplex-constrained weights enforce stable convex blending across model families.",
-                "- Calibration and variance-aware shrinkage correct scale/bias and reduce extreme-margin risk.",
-            ],
-        )
-
-        fig, axes = plt.subplots(2, 2, figsize=(11, 8.5))
-        fig.suptitle("8. Diagnostic plots - residuals and variance", fontsize=14, fontweight="bold")
-        axes[0, 0].hist(final_resid, bins=30, color="#4C78A8", alpha=0.85, edgecolor="white")
-        axes[0, 0].set_title("Residual histogram (final OOF stage)")
-        axes[0, 0].set_xlabel("Residual")
-        axes[0, 0].set_ylabel("Count")
-        ridge_pred = oof_frame["pred__ridge__nonlinear"].to_numpy(dtype=float)
-        huber_pred = oof_frame["pred__huber__nonlinear"].to_numpy(dtype=float)
-        axes[0, 1].hist(y_true - ridge_pred, bins=30, density=True, alpha=0.45, label="Ridge")
-        axes[0, 1].hist(y_true - huber_pred, bins=30, density=True, alpha=0.45, label="Huber")
-        axes[0, 1].set_title("Ridge vs Huber residual distributions")
-        axes[0, 1].legend(fontsize=8)
-        axes[1, 0].scatter(final_oof_pred, final_resid, s=10, alpha=0.5)
-        axes[1, 0].axhline(0, color="black", lw=1)
-        axes[1, 0].set_title("Residual vs fitted")
-        axes[1, 0].set_xlabel("Fitted")
-        axes[1, 0].set_ylabel("Residual")
-        axes[1, 1].scatter(rating_abs, (y_true - cal_ens) ** 2, s=10, alpha=0.3)
-        x_line = np.linspace(float(np.min(rating_abs)), float(np.max(rating_abs)), 200)
-        axes[1, 1].plot(x_line, variance_global[0] + variance_global[1] * x_line, color="#E45756", lw=2)
-        axes[1, 1].set_title("Squared residual vs |rating_diff|")
-        axes[1, 1].set_xlabel("|elo_diff_pre|")
-        axes[1, 1].set_ylabel("Squared residual")
-        fig.tight_layout(rect=[0, 0, 1, 0.96])
-        pdf.savefig(fig, bbox_inches="tight")
-        plt.close(fig)
-
-        fig, axes = plt.subplots(2, 2, figsize=(11, 8.5))
-        fig.suptitle("8. Diagnostic plots - QQ, calibration, derby distribution", fontsize=14, fontweight="bold")
-        (osm, osr), (slope, intercept, rqq) = stats.probplot(final_resid, dist="norm")
-        axes[0, 0].scatter(osm, osr, s=10, alpha=0.6)
-        axes[0, 0].plot(osm, slope * np.asarray(osm) + intercept, color="#E45756", lw=2)
-        axes[0, 0].set_title(f"QQ-style residual plot (r={rqq:.3f})")
-        axes[0, 1].scatter(raw_ens, y_true, s=10, alpha=0.45)
-        xx = np.linspace(float(np.min(raw_ens)), float(np.max(raw_ens)), 200)
-        axes[0, 1].plot(xx, xx, color="black", lw=1, linestyle="--")
-        axes[0, 1].plot(xx, calibration_global[0] + calibration_global[1] * xx, color="#E45756", lw=2)
-        axes[0, 1].set_title("Calibration line: actual vs raw ensemble")
-        derby_final = np.asarray(final_derby_stage["sim_trimmed"], dtype=float)
-        axes[1, 0].hist(derby_final, bins=20, color="#72B7B2", alpha=0.85, edgecolor="white")
-        axes[1, 0].set_title("10. Final derby prediction distribution")
-        axes[1, 0].set_xlabel("Predicted margin")
-        axes[1, 1].scatter(derby_final, np.asarray(final_derby_stage["shrink_factor"], dtype=float), s=14, alpha=0.7)
-        axes[1, 1].set_ylim(0.4, 1.02)
-        axes[1, 1].set_title("Shrink factor vs derby prediction")
-        axes[1, 1].set_xlabel("Predicted margin")
-        axes[1, 1].set_ylabel("Shrink factor")
-        fig.tight_layout(rect=[0, 0, 1, 0.96])
-        pdf.savefig(fig, bbox_inches="tight")
-        plt.close(fig)
-
-        fig, axes = plt.subplots(2, 2, figsize=(11, 8.5))
-        fig.suptitle("9. Sensitivity analyses", fontsize=14, fontweight="bold")
-        base_final = np.asarray(final_derby_stage["sim_trimmed"], dtype=float)
-        axes[0, 0].hist(home_adv_sensitivity["delta_plus"], bins=15, alpha=0.6, label="+10 Elo HA")
-        axes[0, 0].hist(home_adv_sensitivity["delta_minus"], bins=15, alpha=0.6, label="-10 Elo HA")
-        axes[0, 0].axvline(0, color="black", lw=1)
-        axes[0, 0].set_title("HOME_ADV +/-10 sensitivity")
-        axes[0, 0].legend(fontsize=8)
-        axes[0, 1].scatter(base_final, home_adv_sensitivity["delta_plus"], s=12, alpha=0.6, label="+10")
-        axes[0, 1].scatter(base_final, home_adv_sensitivity["delta_minus"], s=12, alpha=0.6, label="-10")
-        axes[0, 1].axhline(0, color="black", lw=1)
-        axes[0, 1].set_title("Sensitivity vs base prediction")
-        axes[0, 1].legend(fontsize=8)
-        axes[1, 0].hist(weight_perturb_summary["mean_abs_shift"], bins=20, color="#F58518", alpha=0.8, edgecolor="white")
-        axes[1, 0].set_title("Ensemble weights perturbation: mean abs shift")
-        axes[1, 1].scatter(weight_perturb_summary["weight_l2_shift"], weight_perturb_summary["mean_abs_shift"], s=12, alpha=0.6)
-        axes[1, 1].set_title("Prediction sensitivity vs weight L2 shift")
-        axes[1, 1].set_xlabel("Weight L2 shift")
-        axes[1, 1].set_ylabel("Mean abs prediction shift")
-        fig.tight_layout(rect=[0, 0, 1, 0.96])
-        pdf.savefig(fig, bbox_inches="tight")
-        plt.close(fig)
-
-        derby_desc = pd.Series(final_pred_int).describe(percentiles=[0.01, 0.05, 0.5, 0.95, 0.99]).to_dict()
-        _new_text_page(
-            pdf,
-            "Final Decisions And Limitations",
-            [
-                "10. Final derby prediction distribution",
-                f"- Count={len(final_pred_int)}, mean={np.mean(final_pred_int):.3f}, std={np.std(final_pred_int):.3f}, min={np.min(final_pred_int)}, max={np.max(final_pred_int)}",
-                f"- Quantiles 1/5/50/95/99: {derby_desc.get('1%', np.nan):.3f}, {derby_desc.get('5%', np.nan):.3f}, {derby_desc.get('50%', np.nan):.3f}, {derby_desc.get('95%', np.nan):.3f}, {derby_desc.get('99%', np.nan):.3f}",
-                "",
-                "11. Key decisions & rationale",
-                "- Final derby stack keeps all required layers: nonlinear transform, ensemble weighting, calibration, uncertainty shrinkage/simulation.",
-                "- Winsorization uses Train margin 1st/99th percentiles before rounding.",
-                "",
-                "12. Limitations and future improvements",
-                "- Derby labels unavailable; all tuning based on Train-only time-aware CV proxies.",
-                "- Global deployment calibration/weights are fit on pooled OOF predictions; nested tuning could further reduce optimism.",
-                "- No injuries/lineups/travel features included.",
-                "- QuantileRegressor comparison omitted to keep deterministic runtime bounded.",
-                "",
-                "Rankings construction",
-                f"- Ranking weights (Elo/Massey/Net): {ranking_weights}",
-                f"- Component OOF ridge weighting proxy: {component_oof_weights}",
-            ],
-        )
-
-        appendix_lines = [
-            "Appendix",
-            "First 10 rows of predictions.csv:",
-            format_df_for_text(pred_input.assign(Team1_WinMargin=final_pred_int).head(10), max_rows=12, width=140),
+        diagram = [
+            "Nested expanding CV (leakage-safe)",
             "",
-            "Top 20 teams in rankings (sorted by Rank):",
-            format_df_for_text(rankings_out.sort_values('Rank', kind='mergesort').head(20), max_rows=22, width=120),
+            "Outer fold k:",
+            "  train(earlier dates) -----------------> val(later dates)",
+            "  1) Fit fold-local ratings/features on outer-train only.",
+            "  2) Train base regressor on outer-train.",
+            "  3) Build inner expanding splits within outer-train.",
+            "  4) Generate inner OOF base predictions.",
+            "  5) Fit postprocessor on inner OOF only.",
+            "  6) Apply postprocessor to outer-val predictions.",
+            "",
+            "No game uses future outcomes for its own features/prediction.",
+            "",
+            "Outer folds:",
         ]
-        _new_text_page(pdf, "Appendix", appendix_lines)
+        for f in folds:
+            diagram.append(
+                f"fold {f['fold']}: train {pd.Timestamp(f['train_start_date']).date()}..{pd.Timestamp(f['train_end_date']).date()} | "
+                f"val {pd.Timestamp(f['val_start_date']).date()}..{pd.Timestamp(f['val_end_date']).date()}"
+            )
+        _add_text_page(pdf, "Validation Design", diagram)
+
+        derivation_lines = [
+            "Affine dispersion correction derivation",
+            "Given y_hat = a + s p, minimize E[(y - (a + s p))^2].",
+            "Set partial derivatives to zero:",
+            "  d/da: E[y - a - s p] = 0 -> a = E[y] - s E[p]",
+            "  d/ds: E[p(y - a - s p)] = 0",
+            "Substitute a and solve:",
+            "  s* = Cov(p, y) / Var(p)",
+            "  a* = mean(y) - s* mean(p)",
+            "Fallback when covariance/variance unstable: s ~= std(y)/std(p).",
+            f"Illustrative prior baseline ratio std(y)/std(p): {BASELINE_DISPERSION_RATIO_REFERENCE:.3f} (43.62/26.15).",
+            "",
+            "Expansion slope rule (anti-compression under under-dispersion):",
+            "  r_base = std(p_oof_train) / std(y_train)",
+            "  if r_base < 0.90: choose s = max(1.0, eta * naive_r), eta in {0.55,0.60,0.65,0.70}",
+            "  where naive_r = std(y_train) / std(p_oof_train)",
+            "  else: s = clip(s_star, 0.8, 1.2)",
+            "  then recompute a = mean(y) - s*mean(p) with selected s",
+            "",
+            "Rating methods",
+            "- Massey ridge anchor: margin = r_home - r_away + h + eps; neutral inference uses h=0.",
+            "- EloK is secondary feature only (pregame diff, optional linear K-decay).",
+            "- EloK is never allowed as standalone model family.",
+        ]
+        _add_text_page(pdf, "Dispersion and Ratings", derivation_lines)
+
+        failure_lines = [
+            "Failure analysis of 308 run",
+            "- Early fold instability produced fold-1 RMSE blowups (observed near ~70).",
+            "- Affine slope expansion could overshoot in small-OOF folds (observed s near ~2.6).",
+            "- Over-dispersion appeared in selected configs (dispersion ratio > 1.05), hurting generalization.",
+            "- 1SE + simplicity-first tie-break could pick brittle configs over better-scoring alternatives.",
+        ]
+        _add_text_page(pdf, "Failure Analysis", failure_lines)
+
+        guardrail_lines = [
+            "Guardrails added",
+            "- Stability lambda enforced: lambda_stability in {0.10, 0.20} (no zero).",
+            "- Selection uses weighted fold metrics (0.10,0.15,0.20,0.25,0.30) to emphasize late season.",
+            "- Eta search restricted to {0.55,0.60,0.65,0.70}; higher eta values (0.8/0.9/1.0) removed.",
+            "- Cap-hit penalty in score and cap-hit rejection gate to avoid selecting cap-bound calibrations.",
+            "- Hard gates: max_fold_rmse, fold1_rmse, mean_dispersion_ratio upper bound, tail-dispersion, under-dispersion expansion checks.",
+            "- Score-first 1SE tie-break: sort by score first, simplicity only as tie-break.",
+            "- Massey alpha grid hardened: removed alpha=0.1; using {1.0, 10.0, 50.0}.",
+            "- Expansion slope caps by inner OOF size: n<120=>1.25, <200=>1.35, <300=>1.45, else 1.60.",
+            "- CV-only over-dispersion correction: if fold disp>1.10 (or 1.15 for n_oof>=300), one-step slope shrink; reject if still above threshold.",
+            "- Piecewise tail eligibility gate: allowed only when max_fold_rmse<=45 and mean_disp in [0.75,1.00].",
+        ]
+        _add_text_page(pdf, "Guardrails Added", guardrail_lines)
+
+        candidate_cols = [
+            c
+            for c in [
+                "config_id",
+                "mean_rmse",
+                "std_rmse",
+                "max_fold_rmse",
+                "fold1_rmse",
+                "mean_tail_rmse",
+                "mean_dispersion_ratio",
+                "mean_dispersion_ratio_w",
+                "mean_affine_s",
+                "mean_blowout_s",
+                "s_cap_hit_rate",
+                "cv_disp_guard_fail_rate",
+                "invalid_postprocess_rate",
+            ]
+            if c in model_summary.columns
+        ]
+        _add_text_page(
+            pdf,
+            f"Candidate Stability Summary (rows={len(model_summary)})",
+            _wrap_lines(_df_text(model_summary[candidate_cols], max_rows=50), width=120),
+        )
+
+        cfg_cols = [
+            c
+            for c in [
+                "config_id",
+                "rating_config_id",
+                "model_config_id",
+                "module",
+                "massey_alpha",
+                "use_elo",
+                "elo_home_adv",
+                "elo_decay_a",
+                "elo_decay_g",
+                "model_name",
+            ]
+            if c in model_summary.columns
+        ]
+        metric_cols = [
+            c
+            for c in [
+                "config_id",
+                "mean_rmse",
+                "mean_rmse_w",
+                "std_rmse",
+                "mean_mae",
+                "mean_mae_w",
+                "mean_tail_rmse",
+                "mean_tail_rmse_w",
+                "mean_xtail_rmse",
+                "mean_xtail_rmse_w",
+                "mean_dispersion_ratio",
+                "mean_dispersion_ratio_w",
+                "mean_tail_dispersion_ratio",
+                "mean_tail_dispersion_ratio_w",
+                "mean_bias",
+                "mean_bias_w",
+                "mean_tail_bias",
+                "mean_tail_bias_w",
+                "n_folds",
+            ]
+            if c in model_summary.columns
+        ]
+        post_cols = [
+            c
+            for c in [
+                "config_id",
+                "mean_base_rmse",
+                "mean_base_tail_rmse",
+                "mean_affine_s",
+                "mean_affine_eta",
+                "mean_affine_r_base",
+                "mean_affine_naive_r",
+                "s_cap_hit_rate",
+                "mean_tail_t",
+                "mean_tail_k",
+                "mean_tail_q",
+                "invalid_postprocess_rate",
+                "simplicity_rank",
+            ]
+            if c in model_summary.columns
+        ]
+        _add_text_page(
+            pdf,
+            f"Model Benchmark Table Group 1 (Config, rows={len(model_summary)})",
+            _wrap_lines(_df_text(model_summary[cfg_cols], max_rows=50), width=120),
+        )
+        _add_text_page(
+            pdf,
+            f"Model Benchmark Table Group 2 (Metrics, rows={len(model_summary)})",
+            _wrap_lines(_df_text(model_summary[metric_cols], max_rows=50), width=120),
+        )
+        _add_text_page(
+            pdf,
+            f"Model Benchmark Table Group 3 (Postprocessing, rows={len(model_summary)})",
+            _wrap_lines(_df_text(model_summary[post_cols], max_rows=50), width=120),
+        )
+
+        tail_improve = float(selected_outer_metrics["base_tail_rmse"].mean() - selected_outer_metrics["tail_rmse"].mean())
+        disp_before = float(np.std(oof_df["y_pred_base"].to_numpy(dtype=float), ddof=0) / max(np.std(oof_df["y_true"].to_numpy(dtype=float), ddof=0), 1e-9))
+        disp_after = float(np.std(oof_df["y_pred_final"].to_numpy(dtype=float), ddof=0) / max(np.std(oof_df["y_true"].to_numpy(dtype=float), ddof=0), 1e-9))
+        aff = selected_config.get("postprocessor_fit", {}).get("affine", {})
+        par = selected_config.get("postprocessor_fit", {}).get("params", {})
+        derby_n = int(selected_config.get("derby_pred_distribution", {}).get("n", -1))
+        if derby_n != 75:
+            raise ValueError(f"Derby prediction count assertion failed in report build: expected 75, got {derby_n}")
+        summary_lines = [
+            "Global vs regime scaling comparison",
+            "- Candidate postprocessors included: none, expand_affine_global, expand_regime_affine_v2, expand_regime_affine_v2_heterosk, expand_piecewise_tail_v2.",
+            f"- Locked module: {selected_config['model_stage']['module']}",
+            "",
+            "Tail and dispersion diagnostics (outer OOF for selected config)",
+            f"- Tail RMSE improvement vs base: {tail_improve:.4f}",
+            f"- Extreme Tail RMSE improvement vs base: {(selected_outer_metrics['base_xtail_rmse'].mean() - selected_outer_metrics['xtail_rmse'].mean()):.4f}",
+            f"- Dispersion ratio base: {disp_before:.4f}",
+            f"- Dispersion ratio final: {disp_after:.4f}",
+            f"- Dispersion moved toward 1.0: {abs(1.0 - disp_after) <= abs(1.0 - disp_before)}",
+            f"- Tail dispersion ratio final: {float(selected_outer_metrics['tail_dispersion_ratio'].mean()):.4f}",
+            "",
+            "Selected dispersion expansion parameters",
+            f"- r_base={aff.get('r_base')}, naive_r={aff.get('naive_r')}",
+            f"- s_star={aff.get('s_star')}, chosen_s={aff.get('s')}, eta={aff.get('eta')}",
+            f"- tail_q={par.get('tail_q')}, tail_t={par.get('tail_t')}, tail_k={par.get('tail_k')}",
+            "",
+            "Derby prediction distribution summary",
+            f"- n={derby_n} (asserted)",
+            f"- mean={selected_config['derby_pred_distribution']['mean']:.4f}",
+            f"- std={selected_config['derby_pred_distribution']['std']:.4f}",
+            f"- p05={selected_config['derby_pred_distribution']['p05']:.4f}",
+            f"- p50={selected_config['derby_pred_distribution']['p50']:.4f}",
+            f"- p95={selected_config['derby_pred_distribution']['p95']:.4f}",
+            "",
+            "Selection lock details",
+            f"- Rating-stage lambda_tail chosen: {selection_lock_info.get('rating_lambda_tail')}",
+            f"- Rating-stage lambda_xtail chosen: {selection_lock_info.get('rating_lambda_xtail')}",
+            f"- Rating-stage lambda chosen: {selection_lock_info.get('rating_lambda')}",
+            f"- Rating-stage lambda_disp chosen: {selection_lock_info.get('rating_lambda_disp')}",
+            f"- Rating-stage lambda_cap_hit chosen: {selection_lock_info.get('rating_lambda_cap_hit')}",
+            f"- Rating-stage lambda_tbias chosen: {selection_lock_info.get('rating_lambda_tbias')}",
+            f"- Rating-stage lambda_tdisp chosen: {selection_lock_info.get('rating_lambda_tdisp')}",
+            f"- Model-stage lambda_tail chosen: {selection_lock_info.get('model_lambda_tail')}",
+            f"- Model-stage lambda_xtail chosen: {selection_lock_info.get('model_lambda_xtail')}",
+            f"- Model-stage lambda chosen: {selection_lock_info.get('model_lambda')}",
+            f"- Model-stage lambda_disp chosen: {selection_lock_info.get('model_lambda_disp')}",
+            f"- Model-stage lambda_cap_hit chosen: {selection_lock_info.get('model_lambda_cap_hit')}",
+            f"- Model-stage lambda_tbias chosen: {selection_lock_info.get('model_lambda_tbias')}",
+            f"- Model-stage lambda_tdisp chosen: {selection_lock_info.get('model_lambda_tdisp')}",
+            f"- Selection gate rejections count: {selection_lock_info.get('gate_rejections_count')}",
+            f"- Massey-only gate applied: {selection_lock_info.get('massey_gate_applied')}",
+            f"- Massey-only gate reason: {selection_lock_info.get('massey_gate_reason')}",
+        ]
+        _add_text_page(pdf, "Results Summary", summary_lines)
+
+        reg = par.get("regimes")
+        if isinstance(reg, dict) and len(reg) > 0:
+            reg_rows = []
+            for rid, rv in reg.items():
+                reg_rows.append(
+                    {
+                        "regime_id": rid,
+                        "n": rv.get("n"),
+                        "s": rv.get("s"),
+                        "a": rv.get("a"),
+                        "eta": rv.get("eta"),
+                        "r_base": rv.get("r_base"),
+                    }
+                )
+            reg_df = pd.DataFrame(reg_rows).sort_values("regime_id", kind="mergesort").reset_index(drop=True)
+            _add_text_page(
+                pdf,
+                f"Per-Regime Expansion Table (rows={len(reg_df)})",
+                _wrap_lines(_df_text(reg_df, max_rows=30), width=120),
+            )
+
+        y_true = oof_df["y_true"].to_numpy(dtype=float)
+        y_base = oof_df["y_pred_base"].to_numpy(dtype=float)
+        y_final = oof_df["y_pred_final"].to_numpy(dtype=float)
+        resid_final = y_true - y_final
+
+        fig1, ax1 = plt.subplots(figsize=(8.5, 5.5))
+        ax1.scatter(y_final, resid_final, s=12, alpha=0.6, edgecolors="none")
+        ax1.axhline(0.0, color="black", linewidth=1.0)
+        ax1.set_title("Residual vs Fitted (OOF Final)")
+        ax1.set_xlabel("Fitted (y_pred_final)")
+        ax1.set_ylabel("Residual (y_true - y_pred_final)")
+        pdf.savefig(fig1, bbox_inches="tight")
+        plt.close(fig1)
+
+        fig2, ax2 = plt.subplots(figsize=(8.5, 5.5))
+        bins = 28
+        ax2.hist(y_true, bins=bins, alpha=0.55, label="y_true")
+        ax2.hist(y_final, bins=bins, alpha=0.55, label="y_pred_final")
+        ax2.set_title("Histogram: OOF Actual vs Final Predictions")
+        ax2.legend()
+        pdf.savefig(fig2, bbox_inches="tight")
+        plt.close(fig2)
+
+        tail_thr = float(np.quantile(np.abs(y_true), 0.80))
+        tail_mask = np.abs(y_true) >= tail_thr
+        fig3, ax3 = plt.subplots(figsize=(8.5, 5.5))
+        ax3.scatter(y_true[tail_mask], y_base[tail_mask], s=14, alpha=0.5, label="base", edgecolors="none")
+        ax3.scatter(y_true[tail_mask], y_final[tail_mask], s=14, alpha=0.5, label="final", edgecolors="none")
+        lo = float(min(np.min(y_true[tail_mask]), np.min(y_final[tail_mask]), np.min(y_base[tail_mask])))
+        hi = float(max(np.max(y_true[tail_mask]), np.max(y_final[tail_mask]), np.max(y_base[tail_mask])))
+        ax3.plot([lo, hi], [lo, hi], color="black", linewidth=1.0)
+        ax3.set_title("Tail Scatter (|y_true| top 20%)")
+        ax3.set_xlabel("y_true")
+        ax3.set_ylabel("prediction")
+        ax3.legend()
+        pdf.savefig(fig3, bbox_inches="tight")
+        plt.close(fig3)
+
+        fig4, ax4 = plt.subplots(figsize=(8.5, 5.5))
+        ax4.scatter(y_true, y_final, s=12, alpha=0.6, edgecolors="none")
+        lo_all = float(min(np.min(y_true), np.min(y_final)))
+        hi_all = float(max(np.max(y_true), np.max(y_final)))
+        ax4.plot([lo_all, hi_all], [lo_all, hi_all], color="black", linewidth=1.0)
+        ax4.set_title("Prediction vs Actual (OOF Final)")
+        ax4.set_xlabel("y_true")
+        ax4.set_ylabel("y_pred_final")
+        pdf.savefig(fig4, bbox_inches="tight")
+        plt.close(fig4)
+
+        fold_disp = (
+            oof_df.groupby("fold_id", as_index=False)
+            .agg(
+                y_sd=("y_true", lambda s: float(np.std(np.asarray(s, dtype=float), ddof=0))),
+                base_sd=("y_pred_base", lambda s: float(np.std(np.asarray(s, dtype=float), ddof=0))),
+                final_sd=("y_pred_final", lambda s: float(np.std(np.asarray(s, dtype=float), ddof=0))),
+            )
+        )
+        fold_disp["base_ratio"] = fold_disp["base_sd"] / np.maximum(fold_disp["y_sd"], 1e-9)
+        fold_disp["final_ratio"] = fold_disp["final_sd"] / np.maximum(fold_disp["y_sd"], 1e-9)
+        x = np.arange(len(fold_disp), dtype=float)
+        fig5, ax5 = plt.subplots(figsize=(8.5, 5.5))
+        ax5.plot(x, fold_disp["base_ratio"], marker="o", label="base ratio")
+        ax5.plot(x, fold_disp["final_ratio"], marker="o", label="final ratio")
+        ax5.axhline(1.0, color="black", linewidth=1.0, linestyle="--")
+        ax5.set_xticks(x)
+        ax5.set_xticklabels([str(int(f)) for f in fold_disp["fold_id"]])
+        ax5.set_title("Dispersion Ratio by Fold (std(pred)/std(y))")
+        ax5.set_xlabel("fold_id")
+        ax5.set_ylabel("dispersion ratio")
+        ax5.legend()
+        pdf.savefig(fig5, bbox_inches="tight")
+        plt.close(fig5)
 
 
-def validate_outputs_and_print_proof(root: Path) -> None:
-    pred_path = root / "predictions.csv"
-    rank_path = root / "rankings.xlsx"
-    report_path = root / "final_report.pdf"
-    run_report_path = root / "run_report.md"
+def _write_run_report_md(
+    out_path: Path,
+    *,
+    git_hash: str,
+    timestamp_utc: str,
+    selected_config_path: Path,
+    selected_config_digest: str,
+    oof_csv_path: Path,
+    oof_parquet_path: Path,
+    runner_up_path: Path,
+    rating_selection: Mapping,
+    model_selection: Mapping,
+    selected_config: Mapping,
+    selected_outer_metrics: pd.DataFrame,
+    invalid_reason_counts: Mapping[str, int],
+    validations: Mapping[str, str],
+) -> None:
+    lines = []
+    lines.append("# Run Report")
+    lines.append("")
+    lines.append(f"- Timestamp (UTC): {timestamp_utc}")
+    lines.append(f"- Git hash: `{git_hash}`")
+    lines.append(f"- selected_config.json: `{selected_config_path}`")
+    lines.append(f"- selected_config digest (sha256): `{selected_config_digest}`")
+    lines.append(f"- oof_predictions.csv: `{oof_csv_path}`")
+    lines.append(f"- oof_predictions.parquet: `{oof_parquet_path}`")
+    lines.append(f"- runner_up_configs.json: `{runner_up_path}`")
+    lines.append("")
+    lines.append("## Selection Lock Proof")
+    lines.append(f"- Rating-stage selected config id: `{rating_selection['selected_config_id']}`")
+    lines.append(f"- Rating-stage tail lambda: `{rating_selection['lambda_tail']}`")
+    lines.append(f"- Rating-stage xtail lambda: `{rating_selection['lambda_xtail']}`")
+    lines.append(f"- Rating-stage stability lambda: `{rating_selection['lambda_stability']}`")
+    lines.append(f"- Rating-stage dispersion lambda: `{rating_selection['lambda_disp']}`")
+    lines.append(f"- Rating-stage cap-hit lambda: `{rating_selection.get('lambda_cap_hit')}`")
+    lines.append(f"- Rating-stage tail-bias lambda: `{rating_selection.get('lambda_tbias')}`")
+    lines.append(f"- Rating-stage tail-dispersion lambda: `{rating_selection['lambda_tdisp']}`")
+    lines.append(f"- Model-stage selected config id: `{model_selection['selected_config_id']}`")
+    lines.append(f"- Model-stage tail lambda: `{model_selection['lambda_tail']}`")
+    lines.append(f"- Model-stage xtail lambda: `{model_selection['lambda_xtail']}`")
+    lines.append(f"- Model-stage stability lambda: `{model_selection['lambda_stability']}`")
+    lines.append(f"- Model-stage dispersion lambda: `{model_selection['lambda_disp']}`")
+    lines.append(f"- Model-stage cap-hit lambda: `{model_selection.get('lambda_cap_hit')}`")
+    lines.append(f"- Model-stage tail-bias lambda: `{model_selection.get('lambda_tbias')}`")
+    lines.append(f"- Model-stage tail-dispersion lambda: `{model_selection['lambda_tdisp']}`")
+    lines.append(f"- Model-stage best-of-three applied: `{model_selection.get('best_of_three_applied', False)}`")
+    lines.append(f"- Model-stage best-of-three feasible count: `{model_selection.get('best_of_three_feasible_count', 0)}`")
+    lines.append(f"- Selection gate rejections count: `{model_selection.get('gate_rejections_count', 0)}`")
+    lines.append(f"- Massey-only gate applied: `{model_selection.get('massey_gate_applied', False)}`")
+    if str(model_selection.get("massey_gate_reason", "")):
+        lines.append(f"- Massey-only gate reason: `{model_selection.get('massey_gate_reason')}`")
+    lines.append("- Full-train stage performed refit-only on locked selected configuration.")
+    lines.append("")
+    lines.append("## Outer Fold Table (Selected Config)")
+    fold_cols = [c for c in ["fold", "rmse", "mae", "tail_rmse", "dispersion_ratio", "max_abs_pred"] if c in selected_outer_metrics.columns]
+    lines.append("")
+    lines.append("```text")
+    lines.append(selected_outer_metrics[fold_cols].sort_values("fold", kind="mergesort").to_string(index=False))
+    lines.append("```")
+    lines.append("")
+    lines.append("## Summary Stats")
+    lines.append(f"- mean_rmse: {selected_outer_metrics['rmse'].mean():.6f}")
+    lines.append(f"- std_rmse: {selected_outer_metrics['rmse'].std(ddof=0):.6f}")
+    lines.append(f"- max_fold_rmse: {selected_outer_metrics['rmse'].max():.6f}")
+    lines.append(f"- mean_disp_ratio: {selected_outer_metrics['dispersion_ratio'].mean():.6f}")
+    lines.append(f"- mean_tailrmse: {selected_outer_metrics['tail_rmse'].mean():.6f}")
+    lines.append("")
+    lines.append("## Diagnostics")
+    lines.append(f"- Mean MAE: {selected_outer_metrics['mae'].mean():.6f}")
+    lines.append(f"- Mean Extreme Tail RMSE: {selected_outer_metrics['xtail_rmse'].mean():.6f}")
+    lines.append(f"- Mean tail dispersion ratio: {selected_outer_metrics['tail_dispersion_ratio'].mean():.6f}")
+    lines.append(f"- Mean bias: {selected_outer_metrics['bias'].mean():.6f}")
+    lines.append(f"- Mean tail bias: {selected_outer_metrics['tail_bias'].mean():.6f}")
+    gate_table = model_selection.get("gate_table")
+    if isinstance(gate_table, pd.DataFrame) and not gate_table.empty:
+        sel_id = str(model_selection.get("selected_config_id"))
+        gsel = gate_table[gate_table["config_id"].astype(str) == sel_id]
+        if not gsel.empty:
+            g = gsel.iloc[0]
+            if "mean_rmse_w" in gsel.columns:
+                lines.append(f"- Weighted mean RMSE: {float(g['mean_rmse_w']):.6f}")
+            if "mean_tail_rmse_w" in gsel.columns:
+                lines.append(f"- Weighted mean Tail RMSE: {float(g['mean_tail_rmse_w']):.6f}")
+            if "mean_dispersion_ratio_w" in gsel.columns:
+                lines.append(f"- Weighted mean dispersion ratio: {float(g['mean_dispersion_ratio_w']):.6f}")
+            if "mean_tail_bias_w" in gsel.columns:
+                lines.append(f"- Weighted mean tail bias: {float(g['mean_tail_bias_w']):.6f}")
+            if "s_cap_hit_rate" in gsel.columns:
+                lines.append(f"- Cap-hit rate: {float(g['s_cap_hit_rate']):.6f}")
+    aff = selected_config.get("postprocessor_fit", {}).get("affine", {})
+    par = selected_config.get("postprocessor_fit", {}).get("params", {})
+    lines.append(f"- Selected expansion affine r_base: {aff.get('r_base')}")
+    lines.append(f"- Selected expansion affine naive_r: {aff.get('naive_r')}")
+    lines.append(f"- Selected expansion affine s_star: {aff.get('s_star')}")
+    lines.append(f"- Selected expansion affine chosen_s: {aff.get('s')}")
+    lines.append(f"- Selected expansion affine eta: {aff.get('eta')}")
+    lines.append(f"- Selected piecewise t: {par.get('tail_t')}")
+    lines.append(f"- Selected piecewise k: {par.get('tail_k')}")
+    lines.append(f"- Selected piecewise q: {par.get('tail_q')}")
+    if isinstance(gate_table, pd.DataFrame) and not gate_table.empty and "rejected" in gate_table.columns:
+        rej = gate_table[gate_table["rejected"]].copy()
+        lines.append(f"- Gate rejected configs: {len(rej)} / {len(gate_table)}")
+        if not rej.empty and "reject_reason" in rej.columns:
+            counts = rej["reject_reason"].fillna("").astype(str).value_counts()
+            for reason, cnt in counts.items():
+                lines.append(f"- Gate reason `{reason}`: {int(cnt)}")
+    if invalid_reason_counts:
+        for reason, cnt in invalid_reason_counts.items():
+            lines.append(f"- Invalid postprocess reason `{reason}`: {int(cnt)}")
+    lines.append("")
+    lines.append("## Validation Proofs")
+    for k, v in validations.items():
+        lines.append(f"- {k}: {v}")
+    out_path.write_text("\n".join(lines), encoding="utf-8")
 
-    if not pred_path.exists():
-        raise FileNotFoundError(pred_path)
-    if not rank_path.exists():
-        raise FileNotFoundError(rank_path)
-    if not report_path.exists():
-        raise FileNotFoundError(report_path)
-    if not run_report_path.exists():
-        raise FileNotFoundError(run_report_path)
-    if report_path.stat().st_size <= 0:
-        raise AssertionError("final_report.pdf must have size > 0")
-    if run_report_path.stat().st_size <= 0:
-        raise AssertionError("run_report.md must have size > 0")
 
-    pred = pd.read_csv(pred_path)
-    rank = pd.read_excel(rank_path)
+def main() -> int:
+    np.random.seed(SEED)
+    run_start_ts = time.time()
 
-    if len(pred) != 75:
-        raise AssertionError(f"predictions.csv must have 75 rows, found {len(pred)}")
-    if pred["Team1_WinMargin"].isna().any():
-        raise AssertionError("predictions.csv has missing Team1_WinMargin")
-    if not pd.to_numeric(pred["Team1_WinMargin"], errors="coerce").notna().all():
-        raise AssertionError("predictions.csv Team1_WinMargin contains non-numeric values")
-
-    if len(rank) != 165:
-        raise AssertionError(f"rankings.xlsx must have 165 rows, found {len(rank)}")
-    rank_vals = pd.to_numeric(rank["Rank"], errors="coerce")
-    if rank_vals.isna().any():
-        raise AssertionError("rankings.xlsx Rank has missing/non-numeric values")
-    if not np.allclose(rank_vals, np.round(rank_vals)):
-        raise AssertionError("rankings.xlsx Rank must be integer-valued")
-    rank_int = rank_vals.astype(int)
-    if set(rank_int.tolist()) != set(range(1, 166)):
-        raise AssertionError("rankings.xlsx Rank must be exactly unique 1..165")
-
-    print("\nPROOF OF COMPLETION")
-    pred_numeric_ok = bool(pd.to_numeric(pred["Team1_WinMargin"], errors="coerce").notna().all())
-    print(
-        f"- predictions.csv exists, rows={len(pred)}, Team1_WinMargin no missing={not pred['Team1_WinMargin'].isna().any()}, numeric={pred_numeric_ok}"
+    train_path = _resolve_input_path([ROOT / "Train.csv"], "Train.csv")
+    pred_path = _resolve_input_path(
+        [
+            ROOT / "Predictions.csv",
+            ROOT / "predictions.csv",
+            ROOT / "Submission.zip" / "Predictions.csv",
+            ROOT / "Submission.zip1" / "Predictions.csv",
+        ],
+        "Predictions.csv",
     )
-    print(
-        f"- rankings.xlsx exists, rows={len(rank)}, Rank exactly integers 1..165={set(rank_int.tolist()) == set(range(1,166))}"
+    rank_path = _resolve_input_path(
+        [
+            ROOT / "Rankings.xlsx",
+            ROOT / "rankings.xlsx",
+            ROOT / "Submission.zip" / "Rankings.xlsx",
+            ROOT / "Submission.zip1" / "Rankings.xlsx",
+        ],
+        "Rankings.xlsx",
     )
-    print(f"- final_report.pdf exists and file size > 0: {report_path.stat().st_size > 0} (bytes={report_path.stat().st_size})")
-    print(f"- run_report.md exists and file size > 0: {run_report_path.stat().st_size > 0} (bytes={run_report_path.stat().st_size})")
-    print("\nhead(10) predictions:")
-    print(pred.head(10).to_string(index=False))
-    print("\nhead(10) rankings sorted by Rank:")
-    print(rank.assign(Rank=rank_int).sort_values("Rank", kind="mergesort").head(10).to_string(index=False))
-    print("\nArtifact file sizes:")
-    for p in [pred_path, rank_path, report_path, run_report_path]:
-        print(f"- {p}: {p.stat().st_size} bytes")
 
-
-def main() -> None:
-    warnings.filterwarnings("ignore", category=FutureWarning)
-    warnings.filterwarnings("ignore", category=UserWarning)
-    warnings.filterwarnings("ignore", category=RuntimeWarning)
-    warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
-    set_deterministic(SEED)
-
-    # Next-generation nested time-aware pipeline (kept in a separate module to preserve this file's legacy helpers/report code).
-    result = run_nextgen_pipeline(ROOT, seed=SEED)
-    validate_outputs_and_print_proof(ROOT)
-    timing_summary = result.get("timing_summary", {}) if isinstance(result, dict) else {}
-    if timing_summary:
-        print("\nTIMING SUMMARY (Top 10 phases/call-sites)")
-        for i, row in enumerate((timing_summary.get("top_slowest_events", []) or [])[:10], start=1):
-            print(f"{i}. {row.get('phase')} [{row.get('detail','')}] {float(row.get('sec',0.0)):.3f}s")
-        fit_counts = timing_summary.get("model_fit_counts_by_family", {}) or {}
-        print("Model fit counts by family:")
-        for fam in sorted(fit_counts):
-            print(f"- {fam}: {fit_counts[fam]}")
-    print("\nFINAL PIPELINE SUMMARY")
-    print(f"- chosen model family: {result.get('selected_model_family')}")
-    print(f"- chosen Elo variant: {result.get('selected_elo_variant')}")
-    print(f"- nested outer RMSE/MAE: {result.get('nested_outer_rmse'):.5f} / {result.get('nested_outer_mae'):.5f}")
-    print(f"- calibration type: {result.get('calibration_type')}")
-    print(f"- scale correction type: {result.get('scale_correction_type')}")
-    print(f"- regime-specific stack used: {result.get('regime_specific_stack_used')}")
-    if result.get("timing_summary_path"):
-        print(f"- timing summary path: {result.get('timing_summary_path')}")
-    if result.get("run_report_path"):
-        print(f"- run report path: {result.get('run_report_path')}")
-    return
-
-    print("pwd")
-    print(str(ROOT))
-    print_ls_la(ROOT)
-
-    paths = assert_required_files(ROOT)
-    inputs = load_inputs(paths)
-    train_raw = inputs["train"]
-    pred_raw = inputs["pred"]
-    rankings_raw = inputs["rankings"]
-    print("\nLoaded input shapes:")
-    print(f"Train.csv: {train_raw.shape}")
-    print(f"Predictions.csv: {pred_raw.shape}")
-    print(f"Rankings.xlsx: {rankings_raw.shape}")
+    train_raw = pd.read_csv(train_path)
+    pred_raw = pd.read_csv(pred_path)
+    rankings_raw = pd.read_excel(rank_path)
 
     train_df = parse_and_sort_train(train_raw)
     pred_df = parse_predictions(pred_raw)
     team_universe = build_team_universe(rankings_raw)
-    coverage = validate_team_coverage(team_universe, train_df, pred_df)
-    if coverage["missing_train"] or coverage["missing_pred"]:
-        print(f"WARNING missing_train={coverage['missing_train']}")
-        print(f"WARNING missing_pred={coverage['missing_pred']}")
-
     team_ids = team_universe["TeamID"].astype(int).tolist()
-    conf_values = sorted(set(train_df["HomeConf"].astype(str)) | set(train_df["AwayConf"].astype(str)))
+
     folds = make_expanding_time_folds(train_df, n_folds=5)
-    print("\nExpanding-window folds:")
-    for f in folds:
-        print(
-            f" fold={f['fold']} train_n={len(f['train_idx'])} val_n={len(f['val_idx'])} "
-            f"train_end={pd.Timestamp(f['train_end_date']).date()} "
-            f"val={pd.Timestamp(f['val_start_date']).date()}..{pd.Timestamp(f['val_end_date']).date()}"
+    fold_count_used = 5
+    print("[folds] using 5 expanding folds globally")
+
+    git_hash = _git_hash()
+    timestamp_utc = datetime.now(timezone.utc).isoformat()
+
+    print("[start] selecting rating config (outer-CV, lockable)")
+    rating_spec, rating_fold_df, rating_selection = _select_rating_config(
+        train_df,
+        folds,
+        team_ids,
+        run_start_ts=run_start_ts,
+    )
+    rating_summary = aggregate_config_metrics(rating_fold_df)
+
+    print("[start] benchmarking model families + dispersion modules on locked rating spec")
+    model_fold_metrics, registry, budget_info = _evaluate_model_stage(
+        train_df,
+        folds,
+        team_ids,
+        rating_spec,
+        run_start_ts=run_start_ts,
+    )
+
+    model_summary = aggregate_config_metrics(model_fold_metrics)
+    model_summary = model_summary.merge(
+        model_fold_metrics.groupby("config_id", as_index=False)
+        .agg(
+            mean_base_rmse=("base_rmse", "mean"),
+            mean_base_tail_rmse=("base_tail_rmse", "mean"),
+            mean_base_xtail_rmse=("base_xtail_rmse", "mean"),
+            mean_base_tail_dispersion_ratio=("base_tail_dispersion_ratio", "mean"),
+            mean_affine_s=("affine_s", "mean"),
+            mean_affine_eta=("affine_eta", "mean"),
+            mean_affine_r_base=("affine_r_base", "mean"),
+            mean_affine_naive_r=("affine_naive_r", "mean"),
+            mean_max_abs_pred=("max_abs_pred", "mean"),
+            max_max_abs_pred=("max_abs_pred", "max"),
+            cv_disp_guard_fail_rate=("cv_disp_guard_reject", "mean"),
+            mean_cv_dispersion_ratio=("cv_dispersion_ratio", "mean"),
+            mean_blowout_s=("blowout_mean_s", "mean"),
+            mean_tail_t=("tail_t", "mean"),
+            mean_tail_k=("tail_k", "mean"),
+            mean_tail_q=("tail_q", "mean"),
+            invalid_postprocess_rate=("invalid_postprocess", "mean"),
+            module=("module", "first"),
+            feature_set=("feature_set", "first"),
+            rating_config_id=("rating_config_id", "first"),
+            model_config_id=("model_config_id", "first"),
+            model_name=("model_name", "first"),
+            massey_alpha=("massey_alpha", "first"),
+            use_elo=("use_elo", "first"),
+            elo_home_adv=("elo_home_adv", "first"),
+            elo_decay_a=("elo_decay_a", "first"),
+            elo_decay_g=("elo_decay_g", "first"),
+        ),
+        on="config_id",
+        how="left",
+    )
+
+    model_selection = select_with_1se_and_stability(
+        model_summary,
+        lambda_tail_values=LAMBDA_TAIL_GRID,
+        lambda_xtail_values=LAMBDA_XTAIL_GRID,
+        lambda_disp_values=LAMBDA_DISP_GRID,
+        lambda_cap_hit_values=LAMBDA_CAP_HIT_GRID,
+        lambda_tbias_values=LAMBDA_TBIAS_GRID,
+        lambda_tdisp_values=LAMBDA_TDISP_GRID,
+        lambda_stability_values=LAMBDA_STABILITY_GRID,
+    )
+    selected_config_id = str(model_selection["selected_config_id"])
+    selected_config_id, massey_gate = _enforce_massey_only_gate(model_fold_metrics, model_summary, selected_config_id)
+    if massey_gate["applied"]:
+        pick_df = model_selection.get("lambda_picks")
+        if isinstance(pick_df, pd.DataFrame) and not pick_df.empty:
+            alt = pick_df[pick_df["config_id"] == selected_config_id].copy()
+            if not alt.empty:
+                alt = alt.sort_values(["score", "mean_rmse", "mean_tail_rmse"], kind="mergesort").iloc[0]
+                model_selection["lambda_tail"] = float(alt["lambda_tail"])
+                model_selection["lambda_xtail"] = float(alt["lambda_xtail"])
+                model_selection["lambda_stability"] = float(alt["lambda_stability"])
+                model_selection["lambda_disp"] = float(alt["lambda_disp"])
+                model_selection["lambda_cap_hit"] = float(alt["lambda_cap_hit"])
+                model_selection["lambda_tbias"] = float(alt["lambda_tbias"])
+                model_selection["lambda_tdisp"] = float(alt["lambda_tdisp"])
+        model_selection["selected_config_id"] = selected_config_id
+        model_selection["massey_gate_applied"] = True
+        model_selection["massey_gate_reason"] = massey_gate["reason"]
+        print(f"[gate] {massey_gate['reason']}")
+    else:
+        model_selection["massey_gate_applied"] = False
+        model_selection["massey_gate_reason"] = ""
+    # Best-of-three safety selection: top-3 by weighted score, then late-fold diagnostics.
+    gate_tbl = model_selection.get("gate_table")
+    if isinstance(gate_tbl, pd.DataFrame) and not gate_tbl.empty:
+        cand = gate_tbl[~gate_tbl["rejected"]].copy() if "rejected" in gate_tbl.columns else gate_tbl.copy()
+        if cand.empty:
+            cand = gate_tbl.copy()
+        rmse_sort_col = "mean_rmse_w" if "mean_rmse_w" in cand.columns else "mean_rmse"
+        tail_rmse_sort_col = "mean_tail_rmse_w" if "mean_tail_rmse_w" in cand.columns else "mean_tail_rmse"
+        cand = cand.sort_values(["score", rmse_sort_col, tail_rmse_sort_col, "simplicity_rank"], kind="mergesort").reset_index(drop=True)
+        top3 = cand.head(3).copy()
+    else:
+        top3 = pd.DataFrame([{"config_id": selected_config_id}])
+
+    rerun_cache: Dict[str, tuple[pd.DataFrame, pd.DataFrame]] = {}
+    runner_rows: List[dict] = []
+    for row in top3.to_dict(orient="records"):
+        cid = str(row.get("config_id", selected_config_id))
+        rs, ms, md = _parse_selected_config(registry, cid)
+        met_df, oof_df = _rerun_selected_for_oof(train_df, folds, team_ids, rs, ms, md)
+        rerun_cache[cid] = (met_df, oof_df)
+        late = _late_fold_diagnostics(met_df, oof_df)
+        runner_rows.append(
+            {
+                "config_id": cid,
+                "module": str(row.get("module", md)),
+                "score": float(row.get("score", np.nan)),
+                "mean_dispersion_ratio_w": float(row.get("mean_dispersion_ratio_w", row.get("mean_dispersion_ratio", np.nan))),
+                "mean_tail_bias_w": float(row.get("mean_tail_bias_w", row.get("mean_tail_bias", np.nan))),
+                **late,
+            }
         )
 
-    best_home_adv, home_adv_detail = tune_home_advantage_elo(train_df, folds, candidate_values=range(0, 121, 10), k_factor=24.0)
-    print(f"\nSelected HOME_ADV={best_home_adv} Elo points via time-aware Elo CV.")
+    runner_df = pd.DataFrame(runner_rows).sort_values(["late_rmse", "score"], kind="mergesort").reset_index(drop=True)
+    feasible = runner_df[
+        (runner_df["mean_dispersion_ratio_w"] >= 0.65)
+        & (runner_df["mean_dispersion_ratio_w"] <= 0.95)
+        & (runner_df["mean_tail_bias_w"].abs() <= 10.0)
+    ].copy()
+    choose_df = feasible if not feasible.empty else runner_df.copy()
+    choose_df["is_regime"] = choose_df["module"].astype(str).isin(["expand_regime_affine_v2", "expand_regime_affine_v2_heterosk"]).astype(int)
+    choose_df = choose_df.sort_values(["late_rmse", "is_regime", "score"], ascending=[True, False, True], kind="mergesort").reset_index(drop=True)
+    selected_config_id = str(choose_df.iloc[0]["config_id"])
+    model_selection["selected_config_id"] = selected_config_id
+    model_selection["best_of_three_applied"] = True
+    model_selection["best_of_three_feasible_count"] = int(len(feasible))
+    model_selection["best_of_three_pool_count"] = int(len(runner_df))
 
-    seq_times = {"base": 0.0, "plus": 0.0, "minus": 0.0}
-    seq_build_base = build_train_sequential_features(train_df, home_adv=float(best_home_adv), team_ids=team_ids)
-    seq_build_plus = build_train_sequential_features(train_df, home_adv=float(best_home_adv + 10), team_ids=team_ids)
-    seq_build_minus = build_train_sequential_features(train_df, home_adv=float(best_home_adv - 10), team_ids=team_ids)
+    sel_rating_spec, sel_model_spec, sel_module = _parse_selected_config(registry, selected_config_id)
 
-    fold_datasets, component_oof_rows = build_fold_datasets(
-        train_df=train_df,
-        folds=folds,
-        seq_base=seq_build_base.features,
-        seq_plus=seq_build_plus.features,
-        seq_minus=seq_build_minus.features,
-        team_ids=team_ids,
-        conf_values=conf_values,
-        seq_build_times=seq_times,
-    )
-
-    seq_derby_base = build_derby_sequential_features(pred_df, seq_build_base.final_states, seq_build_base.final_elo)
-    full_train_tbl, derby_tbl, static_models_full, train_static_full, pred_static_full = build_full_train_and_derby_tables(
-        train_df=train_df,
-        pred_df=pred_df,
-        seq_full_train=seq_build_base.features,
-        seq_derby=seq_derby_base,
-        team_ids=team_ids,
-        conf_values=conf_values,
-    )
-
-    fold_datasets_aug, full_aug = augment_fold_and_full_tables(fold_datasets, full_train_tbl, derby_tbl)
-    feature_cols_by_variant = {
-        "linear": select_feature_columns(full_aug["train"]["linear"]),
-        "nonlinear": select_feature_columns(full_aug["train"]["nonlinear"]),
-    }
-    print(f"\nFeature counts: linear={len(feature_cols_by_variant['linear'])}, nonlinear={len(feature_cols_by_variant['nonlinear'])}")
-
-    sweep = evaluate_base_models(train_df=full_train_tbl, fold_datasets=fold_datasets_aug, feature_cols_by_variant=feature_cols_by_variant)
-    print("\nTop configs by CV RMSE:")
-    print(
-        sweep.config_summary[
-            ["config_name", "rmse_mean", "mae_mean", "bias_mean", "rmse_std", "resid_kurtosis_oof", "outlier_freq_2p5sd_oof"]
-        ].head(12).to_string(index=False)
-    )
-    best_base = sweep.config_summary.sort_values(["rmse_mean", "mae_mean"], kind="mergesort").iloc[0]
-    print(f"\nBase model chosen by RMSE: {best_base['config_name']} (RMSE={best_base['rmse_mean']:.3f})")
-
-    mapping_comparison = summarize_mapping_comparison(sweep.config_summary)
-
-    ensemble_linear = build_ensemble_from_oof(sweep.oof_frame, variant="linear")
-    ensemble_nonlinear = build_ensemble_from_oof(sweep.oof_frame, variant="nonlinear")
-    y_oof = sweep.oof_frame["y_true"].to_numpy(dtype=float)
-    ensemble_comparison = pd.DataFrame(
-        [
-            {
-                "variant": "linear",
-                "rmse_progressive": _rmse(y_oof, ensemble_linear.oof_raw_progressive),
-                "mae_progressive": _mae(y_oof, ensemble_linear.oof_raw_progressive),
-                "rmse_global_weighted_oof": _rmse(y_oof, ensemble_linear.oof_raw_global_weighted),
-                "mae_global_weighted_oof": _mae(y_oof, ensemble_linear.oof_raw_global_weighted),
-                **{f"w_{m}": float(ensemble_linear.global_weights[i]) for i, m in enumerate(BASE_MODELS)},
-            },
-            {
-                "variant": "nonlinear",
-                "rmse_progressive": _rmse(y_oof, ensemble_nonlinear.oof_raw_progressive),
-                "mae_progressive": _mae(y_oof, ensemble_nonlinear.oof_raw_progressive),
-                "rmse_global_weighted_oof": _rmse(y_oof, ensemble_nonlinear.oof_raw_global_weighted),
-                "mae_global_weighted_oof": _mae(y_oof, ensemble_nonlinear.oof_raw_global_weighted),
-                **{f"w_{m}": float(ensemble_nonlinear.global_weights[i]) for i, m in enumerate(BASE_MODELS)},
-            },
-        ]
-    ).sort_values(["rmse_progressive", "rmse_global_weighted_oof"], kind="mergesort")
-    print("\nConstrained ensemble comparison:")
-    print(ensemble_comparison.to_string(index=False))
-
-    raw_ensemble_prog = ensemble_nonlinear.oof_raw_progressive
-    raw_ensemble_global = ensemble_nonlinear.oof_raw_global_weighted
-    calibrated_prog, calibration_fold_df, calibration_global = progressive_calibration(sweep.oof_frame, raw_ensemble_global)
-    var_hat_prog, sd_hat_prog, variance_fold_df, variance_global = progressive_variance_estimation(
-        sweep.oof_frame, pred_for_resid=calibrated_prog, warm_var=float(np.var(y_oof - calibrated_prog))
-    )
-    lambda_shrink, shrink_grid, shrink_aux = choose_shrink_lambda(y_oof, calibrated_prog, var_hat_prog, sd_hat_prog)
-    var_ref = float(shrink_aux["var_ref"][0])
-    shrink_factor_prog = compute_shrink_factor(var_hat_prog, lambda_shrink=lambda_shrink, var_ref=var_ref)
-    shrunk_prog = calibrated_prog * shrink_factor_prog
-    sim_trim_prog = simulate_trimmed_mean(shrunk_prog, sd_hat_prog, seed=SEED + 1001)
-
-    oof_stages = {
-        "ensemble_raw_progressive": raw_ensemble_prog,
-        "ensemble_raw_global_weighted": raw_ensemble_global,
-        "calibrated_progressive": calibrated_prog,
-        "variance_shrunk": shrunk_prog,
-        "sim_trimmed": sim_trim_prog,
-    }
-    stage_metrics = build_stage_metrics_table(y_oof, oof_stages)
-    print("\nPost-ensemble stage comparison (OOF):")
-    print(stage_metrics.to_string(index=False))
-
-    heavy_tail_compare = sweep.config_summary[
-        sweep.config_summary["config_name"].isin(["ridge__nonlinear", "huber__nonlinear"])
-    ][
-        ["config_name", "rmse_mean", "mae_mean", "bias_mean", "resid_skew_oof", "resid_kurtosis_oof", "outlier_freq_2p5sd_oof"]
-    ].sort_values(["rmse_mean", "mae_mean"], kind="mergesort")
-    print("\nHeavy-tail control comparison (Ridge vs Huber):")
-    print(heavy_tail_compare.to_string(index=False))
-
-    full_train_nl = full_aug["train"]["nonlinear"]
-    derby_nl = full_aug["derby"]["nonlinear"]
-    full_pred_by_model = fit_full_base_models_and_predict(full_train_nl, derby_nl, feature_cols_by_variant["nonlinear"])
-    P_derby = np.column_stack([full_pred_by_model[m] for m in BASE_MODELS])
-    raw_derby = P_derby.dot(ensemble_nonlinear.global_weights)
-    global_post = apply_postprocessing_stack(
-        raw_pred=raw_derby,
-        rating_diff_abs=np.abs(derby_tbl["elo_diff_pre"].astype(float).to_numpy()),
-        calib_params=calibration_global,
-        var_params=variance_global,
-        lambda_shrink=lambda_shrink,
-        var_ref=var_ref,
-        sim_seed=SEED + 2001,
-    )
-
-    seq_derby_plus = build_derby_sequential_features(pred_df, seq_build_plus.final_states, seq_build_plus.final_elo)
-    seq_derby_minus = build_derby_sequential_features(pred_df, seq_build_minus.final_states, seq_build_minus.final_elo)
-    full_train_tbl_plus = assemble_model_table(train_df, seq_build_plus.features, train_static_full)
-    full_train_tbl_minus = assemble_model_table(train_df, seq_build_minus.features, train_static_full)
-    derby_tbl_plus = assemble_model_table(pred_df, seq_derby_plus, pred_static_full)
-    derby_tbl_minus = assemble_model_table(pred_df, seq_derby_minus, pred_static_full)
-    for tbl in [full_train_tbl_plus, full_train_tbl_minus]:
-        tbl.index = train_df.index
-    for tbl in [derby_tbl_plus, derby_tbl_minus]:
-        tbl.index = pred_df.index
-    full_train_plus_nl = add_nonlinear_features(full_train_tbl_plus)
-    full_train_minus_nl = add_nonlinear_features(full_train_tbl_minus)
-    derby_plus_nl = add_nonlinear_features(derby_tbl_plus)
-    derby_minus_nl = add_nonlinear_features(derby_tbl_minus)
-
-    plus_by_model = fit_full_base_models_and_predict(full_train_plus_nl, derby_plus_nl, feature_cols_by_variant["nonlinear"])
-    minus_by_model = fit_full_base_models_and_predict(full_train_minus_nl, derby_minus_nl, feature_cols_by_variant["nonlinear"])
-    raw_plus = np.column_stack([plus_by_model[m] for m in BASE_MODELS]).dot(ensemble_nonlinear.global_weights)
-    raw_minus = np.column_stack([minus_by_model[m] for m in BASE_MODELS]).dot(ensemble_nonlinear.global_weights)
-    post_plus = apply_postprocessing_stack(
-        raw_pred=raw_plus,
-        rating_diff_abs=np.abs(derby_tbl_plus["elo_diff_pre"].astype(float).to_numpy()),
-        calib_params=calibration_global,
-        var_params=variance_global,
-        lambda_shrink=lambda_shrink,
-        var_ref=var_ref,
-        sim_seed=SEED + 2002,
-    )
-    post_minus = apply_postprocessing_stack(
-        raw_pred=raw_minus,
-        rating_diff_abs=np.abs(derby_tbl_minus["elo_diff_pre"].astype(float).to_numpy()),
-        calib_params=calibration_global,
-        var_params=variance_global,
-        lambda_shrink=lambda_shrink,
-        var_ref=var_ref,
-        sim_seed=SEED + 2003,
-    )
-    home_adv_sensitivity = pd.DataFrame(
-        {
-            "GameID": pred_df["GameID"].astype(int).to_numpy(),
-            "base_pred": global_post["sim_trimmed"],
-            "pred_plus": post_plus["sim_trimmed"],
-            "pred_minus": post_minus["sim_trimmed"],
-        }
-    )
-    home_adv_sensitivity["delta_plus"] = home_adv_sensitivity["pred_plus"] - home_adv_sensitivity["base_pred"]
-    home_adv_sensitivity["delta_minus"] = home_adv_sensitivity["pred_minus"] - home_adv_sensitivity["base_pred"]
-
-    rng = np.random.default_rng(SEED + 3001)
-    w_base = ensemble_nonlinear.global_weights.copy()
-    base_final_derby = np.asarray(global_post["sim_trimmed"], dtype=float)
-    perturb_rows = []
-    for i in range(200):
-        w = _normalize_simplex(w_base + rng.normal(0.0, 0.04, size=len(w_base)))
-        raw_p = P_derby.dot(w)
-        post_p = apply_postprocessing_stack(
-            raw_pred=raw_p,
-            rating_diff_abs=np.abs(derby_tbl["elo_diff_pre"].astype(float).to_numpy()),
-            calib_params=calibration_global,
-            var_params=variance_global,
-            lambda_shrink=lambda_shrink,
-            var_ref=var_ref,
-            sim_seed=SEED + 4000 + i,
+    print("[start] rerun selected config to produce locked outer OOF predictions artifact")
+    if selected_config_id in rerun_cache:
+        selected_outer_metrics, oof_predictions = rerun_cache[selected_config_id]
+    else:
+        selected_outer_metrics, oof_predictions = _rerun_selected_for_oof(
+            train_df,
+            folds,
+            team_ids,
+            sel_rating_spec,
+            sel_model_spec,
+            sel_module,
         )
-        pred_p = np.asarray(post_p["sim_trimmed"], dtype=float)
-        delta = pred_p - base_final_derby
-        row = {
-            "sample_id": i,
-            "weight_l2_shift": float(np.sqrt(np.sum((w - w_base) ** 2))),
-            "mean_abs_shift": float(np.mean(np.abs(delta))),
-            "max_abs_shift": float(np.max(np.abs(delta))),
-        }
-        for j, m in enumerate(BASE_MODELS):
-            row[f"w_{m}"] = float(w[j])
-        perturb_rows.append(row)
-    weight_perturb_summary = pd.DataFrame(perturb_rows)
 
-    clip_lo = float(train_df["HomeWinMargin"].quantile(0.01))
-    clip_hi = float(train_df["HomeWinMargin"].quantile(0.99))
-    final_derby_float = np.clip(global_post["sim_trimmed"], clip_lo, clip_hi)
-    final_derby_int = np.rint(final_derby_float).astype(int)
-    pred_out = pred_raw.copy()
-    pred_out["Team1_WinMargin"] = final_derby_int
-    pred_out.to_csv(ROOT / "predictions.csv", index=False)
-    print(f"\nWrote predictions.csv with winsorized range [{clip_lo:.2f}, {clip_hi:.2f}] and integer rounding.")
-
-    component_oof_weights = compute_ranking_weights_from_oof(component_oof_rows.copy())
-    ranking_weights = component_oof_weights.copy()
-    final_net_map = static_models_full.offdef.net_rating_map()
-    rankings_out = build_rankings_output(
-        rankings_df=rankings_raw,
-        team_universe=team_universe,
-        final_elo=seq_build_base.final_elo,
-        final_massey=static_models_full.massey.team_rating,
-        final_net=final_net_map,
-        weights=ranking_weights,
-    )
-    rankings_out.to_excel(ROOT / "rankings.xlsx", index=False)
-    print("Wrote rankings.xlsx with Rank 1..165.")
-
-    note_reportlab_missing = False
+    oof_out_csv = ROOT / "oof_predictions.csv"
+    oof_predictions.to_csv(oof_out_csv, index=False)
+    oof_out_parquet: Path | None = ROOT / "oof_predictions.parquet"
     try:
-        import reportlab  # noqa: F401
+        oof_predictions.to_parquet(oof_out_parquet, index=False)
     except Exception:
-        note_reportlab_missing = True
-    build_final_report_pdf(
-        ROOT / "final_report.pdf",
-        train_df=train_df,
-        pred_input=pred_raw.copy(),
-        folds=folds,
-        best_home_adv=int(best_home_adv),
-        home_adv_detail=home_adv_detail.copy(),
-        feature_cols_by_variant=feature_cols_by_variant,
-        sweep=sweep,
-        mapping_comparison=mapping_comparison,
-        ensemble_linear=ensemble_linear,
-        ensemble_nonlinear=ensemble_nonlinear,
-        ensemble_comparison=ensemble_comparison,
-        calibration_fold_df=calibration_fold_df.copy(),
-        calibration_global=calibration_global,
-        variance_fold_df=variance_fold_df.copy(),
-        variance_global=variance_global,
-        shrink_grid=shrink_grid.copy(),
-        lambda_shrink=float(lambda_shrink),
-        var_ref=float(var_ref),
-        stage_metrics=stage_metrics.copy(),
-        heavy_tail_compare=heavy_tail_compare.copy(),
-        oof_frame=sweep.oof_frame.copy(),
-        oof_stages=oof_stages,
-        final_derby_stage=global_post,
-        final_pred_int=final_derby_int,
-        home_adv_sensitivity=home_adv_sensitivity.copy(),
-        weight_perturb_summary=weight_perturb_summary.copy(),
-        rankings_out=rankings_out.copy(),
-        ranking_weights=ranking_weights,
-        component_oof_weights=component_oof_weights,
-        note_reportlab_missing=note_reportlab_missing,
-    )
-    print("Wrote final_report.pdf")
+        oof_out_parquet = None
 
-    validate_outputs_and_print_proof(ROOT)
+    print("[start] full-train refit with locked config only")
+    full_train_tbl, massey_model, elo_model, history_states = build_full_train_table(
+        train_df,
+        team_ids,
+        massey_alpha=sel_rating_spec.massey_alpha,
+        use_elo=sel_rating_spec.use_elo,
+        elo_home_adv=sel_rating_spec.elo_home_adv,
+        elo_k=sel_rating_spec.elo_k,
+        elo_decay_a=sel_rating_spec.elo_decay_a,
+        elo_decay_g=sel_rating_spec.elo_decay_g,
+    )
+    selected_feature_set, selected_feature_cols = feature_cols_for_rating_spec(sel_rating_spec)
+
+    X_full, y_full = _get_xy(full_train_tbl, feature_cols=selected_feature_cols)
+    base_est = make_estimator(sel_model_spec, seed=SEED)
+    base_est.fit(X_full, y_full)
+
+    inner_oof_full = build_inner_oof(
+        train_df,
+        team_ids=team_ids,
+        rating_spec=sel_rating_spec,
+        model_spec=sel_model_spec,
+        feature_cols=selected_feature_cols,
+    )
+    post_full = fit_postprocessor(sel_module, inner_oof_full)
+
+    derby_tbl = build_derby_table(pred_df, massey_model, elo_model, history_states, use_elo=sel_rating_spec.use_elo)
+    X_derby = derby_tbl.reindex(columns=selected_feature_cols, fill_value=0.0).astype(float)
+    pred_base_derby = np.asarray(base_est.predict(X_derby), dtype=float)
+    derby_gp_min = np.minimum(derby_tbl["games_played_home"].to_numpy(dtype=float), derby_tbl["games_played_away"].to_numpy(dtype=float))
+    derby_post = apply_postprocessor(post_full, pred_base_derby, derby_tbl["d_key"].to_numpy(dtype=float), derby_gp_min)
+    pred_final_derby = np.asarray(derby_post["y_pred_final"], dtype=float)
+    if len(pred_final_derby) != 75:
+        raise ValueError(f"Derby prediction count mismatch: expected 75, got {len(pred_final_derby)}")
+    pred_final_int = np.rint(pred_final_derby).astype(int)
+
+    predictions_out = pred_df.copy()
+    predictions_out["Team1_WinMargin"] = pred_final_int.astype(int)
+    predictions_path = ROOT / "predictions.csv"
+    predictions_out.to_csv(predictions_path, index=False)
+
+    rankings_out = _build_rankings_output(rankings_raw, massey_model.team_rating, elo_model.ratings, use_elo=sel_rating_spec.use_elo)
+    rankings_path = ROOT / "rankings.xlsx"
+    rankings_out.to_excel(rankings_path, index=False)
+
+    selected_config = {
+        "selection_lock": True,
+        "elok_secondary_only": True,
+        "selected_at": timestamp_utc,
+        "git_hash": git_hash,
+        "outer_fold_count": fold_count_used,
+        "rating_stage": {
+            "config_id": rating_selection["selected_config_id"],
+            "lambda_tail": rating_selection["lambda_tail"],
+            "lambda_xtail": rating_selection["lambda_xtail"],
+            "lambda_stability": rating_selection["lambda_stability"],
+            "lambda_disp": rating_selection["lambda_disp"],
+            "lambda_cap_hit": rating_selection.get("lambda_cap_hit"),
+            "lambda_tbias": rating_selection.get("lambda_tbias"),
+            "lambda_tdisp": rating_selection["lambda_tdisp"],
+            "spec": asdict(sel_rating_spec),
+        },
+        "model_stage": {
+            "config_id": selected_config_id,
+            "lambda_tail": model_selection["lambda_tail"],
+            "lambda_xtail": model_selection["lambda_xtail"],
+            "lambda_stability": model_selection["lambda_stability"],
+            "lambda_disp": model_selection["lambda_disp"],
+            "lambda_cap_hit": model_selection.get("lambda_cap_hit"),
+            "lambda_tbias": model_selection.get("lambda_tbias"),
+            "lambda_tdisp": model_selection["lambda_tdisp"],
+            "model_spec": {"model_name": sel_model_spec.model_name, "params": sel_model_spec.params},
+            "module": sel_module,
+            "gate_rejections_count": int(model_selection.get("gate_rejections_count", 0)),
+            "massey_gate_applied": bool(model_selection.get("massey_gate_applied", False)),
+            "massey_gate_reason": str(model_selection.get("massey_gate_reason", "")),
+            "best_of_three_applied": bool(model_selection.get("best_of_three_applied", False)),
+            "best_of_three_feasible_count": int(model_selection.get("best_of_three_feasible_count", 0)),
+            "best_of_three_pool_count": int(model_selection.get("best_of_three_pool_count", 0)),
+        },
+        "oof_paths": {
+            "csv": str(oof_out_csv),
+            "parquet": str(oof_out_parquet) if oof_out_parquet is not None else "",
+        },
+        "feature_set": selected_feature_set,
+        "features": selected_feature_cols,
+        "selection_score": "mean_rmse_w + lambda_tail*(mean_tail_rmse_w/mean_rmse_w) + lambda_xtail*(mean_xtail_rmse_w/mean_rmse_w) + lambda_disp*abs(log(mean_dispersion_ratio_w)) + lambda_cap_hit*s_cap_hit_rate + lambda_tbias*abs(mean_tail_bias_w) + lambda_tdisp*abs(log(mean_tail_dispersion_ratio_w)) + lambda_stability*std_rmse",
+        "postprocessor_fit": post_full,
+        "derby_pred_distribution": {
+            "n": int(len(pred_final_derby)),
+            "mean": float(np.mean(pred_final_derby)),
+            "std": float(np.std(pred_final_derby, ddof=0)),
+            "p05": float(np.quantile(pred_final_derby, 0.05)),
+            "p50": float(np.quantile(pred_final_derby, 0.50)),
+            "p95": float(np.quantile(pred_final_derby, 0.95)),
+        },
+    }
+
+    runner_up_path = ROOT / "runner_up_configs.json"
+    runner_rows_json = json.loads(runner_df.to_json(orient="records"))
+    _json_dump(
+        runner_up_path,
+        {
+            "timestamp_utc": timestamp_utc,
+            "chosen_config_id": selected_config_id,
+            "top_candidates": runner_rows_json,
+        },
+    )
+    selected_config["runner_up_configs_path"] = str(runner_up_path)
+
+    selected_config_path = ROOT / "selected_config.json"
+    _json_dump(selected_config_path, selected_config)
+    selected_digest = _sha256(selected_config_path)
+
+    run_metadata = {
+        "timestamp_utc": timestamp_utc,
+        "git_hash": git_hash,
+        "python": sys.version,
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "processor": platform.processor(),
+        "cpu_count": os.cpu_count(),
+        "cwd": str(ROOT),
+        "input_paths": {"train": str(train_path), "predictions_seed": str(pred_path), "rankings_seed": str(rank_path)},
+        "thread_env": {
+            "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS"),
+            "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS"),
+            "OPENBLAS_NUM_THREADS": os.environ.get("OPENBLAS_NUM_THREADS"),
+            "NUMEXPR_NUM_THREADS": os.environ.get("NUMEXPR_NUM_THREADS"),
+        },
+        "search_env": {
+            "ALGOSPORTS_N_JOBS": str(os.environ.get("ALGOSPORTS_N_JOBS", N_JOBS)),
+            "ALGOSPORTS_MAX_MODEL_FITS": str(os.environ.get("ALGOSPORTS_MAX_MODEL_FITS", MAX_MODEL_FITS)),
+            "ALGOSPORTS_MAX_TOTAL_SECONDS": str(os.environ.get("ALGOSPORTS_MAX_TOTAL_SECONDS", MAX_TOTAL_SECONDS)),
+        },
+        "n_jobs": min(N_JOBS, len(folds)),
+        "max_model_fits": int(MAX_MODEL_FITS),
+        "max_total_seconds": int(MAX_TOTAL_SECONDS),
+        "budget_info": budget_info,
+        "outer_fold_count": fold_count_used,
+    }
+    run_metadata_path = ROOT / "run_metadata.json"
+    _json_dump(run_metadata_path, run_metadata)
+
+    final_report_path = ROOT / "final_report.pdf"
+    _build_pdf_report(
+        final_report_path,
+        git_hash=git_hash,
+        timestamp_utc=timestamp_utc,
+        selected_config_digest=selected_digest,
+        selected_config=selected_config,
+        selection_lock_info={
+            "rating_lambda_tail": rating_selection["lambda_tail"],
+            "rating_lambda_xtail": rating_selection["lambda_xtail"],
+            "rating_lambda": rating_selection["lambda_stability"],
+            "rating_lambda_disp": rating_selection["lambda_disp"],
+            "rating_lambda_cap_hit": rating_selection.get("lambda_cap_hit"),
+            "rating_lambda_tbias": rating_selection.get("lambda_tbias"),
+            "rating_lambda_tdisp": rating_selection["lambda_tdisp"],
+            "model_lambda_tail": model_selection["lambda_tail"],
+            "model_lambda_xtail": model_selection["lambda_xtail"],
+            "model_lambda": model_selection["lambda_stability"],
+            "model_lambda_disp": model_selection["lambda_disp"],
+            "model_lambda_cap_hit": model_selection.get("lambda_cap_hit"),
+            "model_lambda_tbias": model_selection.get("lambda_tbias"),
+            "model_lambda_tdisp": model_selection["lambda_tdisp"],
+            "gate_rejections_count": model_selection.get("gate_rejections_count", 0),
+            "massey_gate_applied": model_selection.get("massey_gate_applied", False),
+            "massey_gate_reason": model_selection.get("massey_gate_reason", ""),
+        },
+        folds=folds,
+        rating_summary=rating_summary,
+        model_summary=model_summary,
+        selected_outer_metrics=selected_outer_metrics,
+        oof_df=oof_predictions,
+        run_metadata_path=run_metadata_path,
+        selected_config_path=selected_config_path,
+    )
+
+    validations = {}
+    pred_check = pd.read_csv(predictions_path)
+    validations["predictions.csv exists"] = str(predictions_path.exists())
+    validations["predictions rows"] = str(len(pred_check))
+    validations["predictions Team1_WinMargin int"] = str(pd.api.types.is_integer_dtype(pred_check["Team1_WinMargin"]))
+    validations["predictions Team1_WinMargin missing"] = str(int(pred_check["Team1_WinMargin"].isna().sum()))
+
+    rank_check = pd.read_excel(rankings_path)
+    validations["rankings.xlsx exists"] = str(rankings_path.exists())
+    validations["rankings rows"] = str(len(rank_check))
+    rank_set_ok = set(rank_check["Rank"].astype(int).tolist()) == set(range(1, len(rank_check) + 1))
+    validations["rank permutation 1..165"] = str(rank_set_ok)
+
+    validations["final_report.pdf exists"] = str(final_report_path.exists())
+    validations["final_report.pdf size_bytes"] = str(final_report_path.stat().st_size if final_report_path.exists() else 0)
+    validations["oof_predictions.csv exists"] = str(oof_out_csv.exists())
+    validations["oof_predictions.parquet exists"] = str(oof_out_parquet is not None and oof_out_parquet.exists())
+    validations["runner_up_configs.json exists"] = str(runner_up_path.exists())
+    required_oof_cols = {
+        "GameID",
+        "Date",
+        "HomeID",
+        "AwayID",
+        "y_true",
+        "y_pred_base",
+        "y_pred_final",
+        "fold_id",
+        "regime_id",
+        "mismatch_key",
+        "info_key",
+        "postprocess_s_used",
+        "postprocess_t_used",
+        "postprocess_k_used",
+        "postprocess_eta_used",
+    }
+    oof_check = pd.read_csv(oof_out_csv)
+    validations["oof_predictions required cols"] = str(required_oof_cols.issubset(set(oof_check.columns)))
+
+    run_report_path = ROOT / "run_report.md"
+    invalid_reason_counts = (
+        model_fold_metrics.loc[model_fold_metrics["invalid_postprocess"].astype(int) == 1, "invalid_reason"]
+        .fillna("")
+        .astype(str)
+        .loc[lambda s: s != ""]
+        .value_counts()
+        .to_dict()
+    )
+    _write_run_report_md(
+        run_report_path,
+        git_hash=git_hash,
+        timestamp_utc=timestamp_utc,
+        selected_config_path=selected_config_path,
+        selected_config_digest=selected_digest,
+        oof_csv_path=oof_out_csv,
+        oof_parquet_path=oof_out_parquet if oof_out_parquet is not None else Path(""),
+        runner_up_path=runner_up_path,
+        rating_selection=rating_selection,
+        model_selection=model_selection,
+        selected_config=selected_config,
+        selected_outer_metrics=selected_outer_metrics,
+        invalid_reason_counts=invalid_reason_counts,
+        validations=validations,
+    )
+
+    print("\n[hard-stop validations]")
+    print(f"predictions.csv exists={predictions_path.exists()} rows={len(pred_check)} missing={int(pred_check['Team1_WinMargin'].isna().sum())}")
+    print(f"rankings.xlsx exists={rankings_path.exists()} rows={len(rank_check)} rank_perm_1..{len(rank_check)}={rank_set_ok}")
+    print(f"final_report.pdf exists={final_report_path.exists()} size={final_report_path.stat().st_size if final_report_path.exists() else 0}")
+    print(f"oof_predictions.csv exists={oof_out_csv.exists()} required_cols_ok={required_oof_cols.issubset(set(oof_check.columns))}")
+    print(f"runner_up_configs.json exists={runner_up_path.exists()}")
+    print(f"selected_config.json digest={selected_digest}")
+    print("\npredictions head(10):")
+    print(pred_check.head(10).to_string(index=False))
+    print("\nrankings top10 by rank:")
+    print(rank_check.sort_values("Rank", kind="mergesort").head(10).to_string(index=False))
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
