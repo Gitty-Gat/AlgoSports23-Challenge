@@ -1,17 +1,17 @@
 {
   "budget_triggered": [],
   "fallback_triggered": false,
-  "model_fit_count": 2219,
+  "model_fit_count": 3011,
   "no_regression_to_mean_shortcut": true,
   "oof_predictions_csv": "C:\\algosports23\\AlgoSports23-Challenge\\oof_predictions.csv",
   "phase_metrics": {
     "cap_hit_rate": 0.0,
-    "corr": 0.523715606436142,
-    "fold2_rmse": 38.922696534809496,
-    "mean_rmse": 36.598070146036235,
-    "mean_tail_bias": -9.136117323145061,
-    "mean_tail_dispersion": 0.4417080855547648,
-    "mean_tail_rmse": 57.2834647262845
+    "corr": 0.5211267916294419,
+    "fold2_rmse": 38.75282138866413,
+    "mean_rmse": 36.674008467820364,
+    "mean_tail_bias": -8.987592668184956,
+    "mean_tail_dispersion": 0.4400479943178377,
+    "mean_tail_rmse": 57.40130241115113
   },
   "phase_run": "run1",
   "resolved_budget_config": {
@@ -41,6 +41,6 @@
   },
   "seed": 23,
   "selected_config_path": "C:\\algosports23\\AlgoSports23-Challenge\\selected_config.json",
-  "timestamp_utc": "2026-03-03T02:48:36.035014+00:00",
-  "timing_summary_path": "C:\\algosports23\\AlgoSports23-Challenge\\timing_summary_phase1_debug_run1_noaffine.json"
+  "timestamp_utc": "2026-03-03T03:34:04.692596+00:00",
+  "timing_summary_path": "C:\\algosports23\\AlgoSports23-Challenge\\timing_summary_phase1_debug_run1_noaffine_full.json"
 }

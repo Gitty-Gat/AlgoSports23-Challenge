@@ -1,0 +1,5 @@
+[nextgen] Resolved Budget Config: max_total_seconds=3600, max_scan_seconds=1200, max_fits=10000 | raw_env={'ALGOSPORTS_MAX_MODEL_FITS': '10000', 'ALGOSPORTS_MAX_FITS': '10000', 'ALGOSPORTS_MAX_TOTAL_SECONDS': '3600', 'ALGOSPORTS_MAX_SCAN_SECONDS': '1200'}
+[nextgen] budget failure: Total-time budget exhausted during family prediction.
+
+
+--- STDERR ---
