@@ -294,6 +294,19 @@ def _env_half_life_list(name: str, default: Sequence[Optional[int]]) -> List[Opt
     return out if out else list(default)
 
 
+def _env_q50_blend_list(name: str, default: Sequence[float]) -> List[float]:
+    vals = _env_float_list(name, default)
+    out: List[float] = []
+    seen: set[float] = set()
+    for v in vals:
+        vv = float(np.clip(float(v), 0.0, 1.0))
+        # Keep stable ordering while dropping dupes from env input.
+        if vv not in seen:
+            seen.add(vv)
+            out.append(vv)
+    return out if out else [float(x) for x in default]
+
+
 def _strict_budget_abort_enabled() -> bool:
     return _env_bool("ALGOSPORTS_ABORT_ON_BUDGET_HIT", True)
 
@@ -631,11 +644,23 @@ def _select_feature_columns(df: pd.DataFrame) -> List[str]:
     return sorted(cols)
 
 
+def _normalize_feature_profile(profile: str) -> str:
+    p = str(profile).strip().lower()
+    if p in {"profile_f", "f", "full"}:
+        return "full_recency"
+    if p in {"profile_r", "r", "recency_focus"}:
+        return "recency_focus"
+    if p in {"profile_s", "s", "signal_core"}:
+        return "signal_core"
+    return p
+
+
 def _feature_profile_columns(all_cols: Sequence[str], profile: str) -> List[str]:
     cols = list(all_cols)
-    if profile == "full_recency":
+    p = _normalize_feature_profile(profile)
+    if p == "full_recency":
         return cols
-    if profile == "compact_recency":
+    if p == "compact_recency":
         keep = []
         for c in cols:
             if re.search(r"(ema_(margin|oppadj|winrate)_a20_|last5_|trend_|consistency_)", c):
@@ -645,9 +670,28 @@ def _feature_profile_columns(all_cols: Sequence[str], profile: str) -> List[str]
             else:
                 keep.append(c)
         return sorted(dict.fromkeys(keep))
-    if profile == "no_extra_recency":
+    if p == "no_extra_recency":
         pat = re.compile(r"(ema_(margin|oppadj|winrate)_a\d+|last\d+_|trend_|consistency_)")
         return [c for c in cols if not pat.search(c)]
+    if p == "signal_core":
+        # Signal-core profile: all base (non-derived) numeric features, excluding row/date key.
+        return sorted(dict.fromkeys([c for c in cols if "__" not in c and c != "d_key"]))
+    if p == "recency_focus":
+        core = set(_feature_profile_columns(cols, "signal_core"))
+        recency_patterns = [
+            r"^ema_(margin|oppadj|winrate)_a(10|20|35)_diff$",
+            r"^last(3|5|8)_(margin|oppadj)_diff$",
+            r"^trend_.*_diff$",
+            r"^consistency_ratio_diff$",
+            r"^volatility_(diff|sum)$",
+        ]
+        keep: List[str] = []
+        for c in cols:
+            if "__" in c:
+                continue
+            if c in core or any(re.search(pat, c) for pat in recency_patterns):
+                keep.append(c)
+        return sorted(dict.fromkeys(keep))
     raise ValueError(profile)
 
 
@@ -1026,7 +1070,11 @@ def _build_elo_variants() -> Dict[str, EloVariantConfig]:
     }
     only = _env_csv_list("ALGOSPORTS_ELO_VARIANTS", [])
     if only:
-        keep = [k for k in only if k in variants]
+        alias = {
+            "elo_dynamic_k_teamha_deacy": "elo_dynamic_k_teamha_decay",
+        }
+        normalized = [alias.get(str(k).strip().lower(), str(k).strip()) for k in only]
+        keep = [k for k in normalized if k in variants]
         if keep:
             return {k: variants[k] for k in keep}
     return variants
@@ -1147,11 +1195,23 @@ def _prepare_variant_outer_data(
         outer_train_nl = _add_nonlinear_features(outer_train_tbl)
         outer_val_nl = _add_nonlinear_features(outer_val_tbl)
         all_cols = _select_feature_columns(outer_train_nl)
-        feature_cols_by_profile = {
-            "no_extra_recency": _feature_profile_columns(all_cols, "no_extra_recency"),
-            "compact_recency": _feature_profile_columns(all_cols, "compact_recency"),
-            "full_recency": _feature_profile_columns(all_cols, "full_recency"),
-        }
+        env_profiles = _env_csv_list("ALGOSPORTS_FEATURE_PROFILES", ["compact_recency", "full_recency"])
+        wanted_profiles = [
+            "no_extra_recency",
+            "compact_recency",
+            "full_recency",
+            "signal_core",
+            "recency_focus",
+            *[_normalize_feature_profile(p) for p in env_profiles],
+        ]
+        feature_cols_by_profile: Dict[str, List[str]] = {}
+        for p in wanted_profiles:
+            if p in feature_cols_by_profile:
+                continue
+            try:
+                feature_cols_by_profile[p] = _feature_profile_columns(all_cols, p)
+            except Exception:
+                continue
 
         inner_splits = []
         for inner in inner_folds:
@@ -1303,7 +1363,11 @@ def _scan_and_select_core_candidates(
         all_candidates: List[CoreCandidate] = []
         half_life_grid = _env_half_life_list("ALGOSPORTS_HALF_LIFE_GRID", [None, 20, 40, 60])
         ridge_alpha_grid = _env_float_list("ALGOSPORTS_RIDGE_ALPHA_GRID", [1.0, 2.0, 4.0, 8.0, 16.0])
-        feature_profiles = _env_csv_list("ALGOSPORTS_FEATURE_PROFILES", ["compact_recency", "full_recency"])
+        feature_profiles = [
+            _normalize_feature_profile(p)
+            for p in _env_csv_list("ALGOSPORTS_FEATURE_PROFILES", ["compact_recency", "full_recency"])
+        ]
+        feature_profiles = list(dict.fromkeys([p for p in feature_profiles if p]))
         histgb_idx_values = list(range(len(histgb_grid)))
         scan_return_top = int(cfg.scan_top_candidates_return)
         scan_prune_topn = int(cfg.scan_prune_keep_top_n)
@@ -1672,6 +1736,7 @@ def _make_postprocess_grid() -> List[PostprocessCandidate]:
     if not modules:
         modules = list(default_modules)
     eta_values = _env_float_list("ALGOSPORTS_ETA_GRID", ETA_GRID)
+    q50_values = _env_q50_blend_list("ALGOSPORTS_Q50_BLEND_GRID", [0.0, 0.20])
     out: List[PostprocessCandidate] = []
     for module in modules:
         if module == "expand_affine_global":
@@ -1682,7 +1747,7 @@ def _make_postprocess_grid() -> List[PostprocessCandidate]:
         else:
             regime_stack, cal_mode, scale_mode = True, "pooled", "pooled"
         for eta in eta_values:
-            for q50_blend in [0.0, 0.20]:
+            for q50_blend in q50_values:
                 for winsor_q in [0.0, 0.01]:
                     out.append(
                         PostprocessCandidate(
@@ -3310,6 +3375,7 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
         and str(top3.iloc[0]["module_name"]) == "expand_affine_global"
     ):
         probe_rows: List[dict] = []
+        probe_q50_values = _env_q50_blend_list("ALGOSPORTS_Q50_BLEND_GRID", [0.20])
         for bundle in final_bundle_lookup.values():
             cand_obj: CoreCandidate = bundle["candidate"]
             inner_oof_probe = bundle["inner_oof"]
@@ -3318,26 +3384,27 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
             for module_name, scale_mode in [("expand_regime_affine_v2", "pooled"), ("expand_regime_affine_v2_heterosk", "regime")]:
                 best_probe = None
                 for eta in ETA_GRID:
-                    probe_cand = PostprocessCandidate(
-                        module_name=module_name,
-                        regime_stack=True,
-                        calibration_mode="regime",
-                        scale_mode=scale_mode,
-                        q50_blend=0.20,
-                        winsor_q=0.01,
-                        eta=float(eta),
-                    )
-                    m, _, _ = _evaluate_postprocess_progressive(inner_oof_probe, probe_cand)
-                    probe_score = (
-                        float(m["rmse_final"])
-                        + 0.35 * float(m["tail_rmse_final"])
-                        + 0.08 * abs(float(m["tail_bias_final"]))
-                        + 0.12 * abs(float(m["tail_dispersion_ratio_final"]) - 1.0)
-                        + 0.12 * abs(1.0 - float(m["corr_final"]))
-                        + (1000.0 if bool(m.get("invalid_gate", False)) else 0.0)
-                    )
-                    if best_probe is None or probe_score < best_probe["probe_score"]:
-                        best_probe = {"m": m, "probe_score": float(probe_score), "probe_cand": probe_cand}
+                    for q50_blend in probe_q50_values:
+                        probe_cand = PostprocessCandidate(
+                            module_name=module_name,
+                            regime_stack=True,
+                            calibration_mode="regime",
+                            scale_mode=scale_mode,
+                            q50_blend=float(q50_blend),
+                            winsor_q=0.01,
+                            eta=float(eta),
+                        )
+                        m, _, _ = _evaluate_postprocess_progressive(inner_oof_probe, probe_cand)
+                        probe_score = (
+                            float(m["rmse_final"])
+                            + 0.35 * float(m["tail_rmse_final"])
+                            + 0.08 * abs(float(m["tail_bias_final"]))
+                            + 0.12 * abs(float(m["tail_dispersion_ratio_final"]) - 1.0)
+                            + 0.12 * abs(1.0 - float(m["corr_final"]))
+                            + (1000.0 if bool(m.get("invalid_gate", False)) else 0.0)
+                        )
+                        if best_probe is None or probe_score < best_probe["probe_score"]:
+                            best_probe = {"m": m, "probe_score": float(probe_score), "probe_cand": probe_cand}
                 if best_probe is not None:
                     m = best_probe["m"]
                     pc = best_probe["probe_cand"]
