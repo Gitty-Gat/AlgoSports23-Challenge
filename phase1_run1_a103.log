@@ -1,0 +1,46 @@
+[nextgen] Resolved Budget Config: max_total_seconds=3600, max_scan_seconds=1200, max_fits=10000 | raw_env={'ALGOSPORTS_MAX_MODEL_FITS': '10000', 'ALGOSPORTS_MAX_FITS': '10000', 'ALGOSPORTS_MAX_TOTAL_SECONDS': '3600', 'ALGOSPORTS_MAX_SCAN_SECONDS': '1200'}
+
+Runtime timing summary
+Hotspot totals (sec):
+- _scan_and_select_core_candidates: 1895.973s (calls=6)
+- _core_scan_score: 1895.884s (calls=3040)
+- _generate_inner_oof_and_outer_preds: 1572.681s (calls=52)
+- _predict_family: 3474.409s (calls=9416)
+- _build_split_tables: 4.848s (calls=96)
+- _prepare_variant_outer_data: 5.421s (calls=24)
+Predict family totals (sec):
+- histgb: 2028.397s (calls=4289)
+- gbr: 670.948s (calls=209)
+- histgb_bag: 431.645s (calls=209)
+- histgb_q50: 268.819s (calls=209)
+- huber: 66.563s (calls=209)
+- ridge: 6.591s (calls=4289)
+- histgb_q20: 0.724s (calls=1)
+- histgb_q80: 0.722s (calls=1)
+Model fit counts by family:
+- gbr: 209
+- histgb: 4289
+- histgb_bag: 627
+- histgb_q20: 1
+- histgb_q50: 209
+- histgb_q80: 1
+- huber: 209
+- ridge: 4289
+Top 10 slowest call sites / phases:
+1. run_nextgen_pipeline_total [total]: 3521.838s
+2. _scan_and_select_core_candidates: 603.456s
+3. _scan_and_select_core_candidates: 468.995s
+4. _scan_and_select_core_candidates: 317.758s
+5. _scan_and_select_core_candidates: 230.779s
+6. _scan_and_select_core_candidates: 209.264s
+7. _scan_and_select_core_candidates: 65.721s
+8. _generate_inner_oof_and_outer_preds: 58.725s
+9. _generate_inner_oof_and_outer_preds: 58.027s
+10. _generate_inner_oof_and_outer_preds: 57.656s
+[nextgen] selected_model_family=Regime-aware simplex stack + q50 blend + nested calibration/scale
+[nextgen] selected_module=expand_affine_global eta=0.6
+[nextgen] phase_metrics={'mean_rmse': 37.943035951641036, 'corr': 0.4938353957395224, 'mean_tail_dispersion': 0.47239114460760057, 'mean_tail_bias': -9.907277944361665, 'fold2_rmse': 39.553479162109475, 'cap_hit_rate': 0.0, 'mean_tail_rmse': 57.62275791860803}
+[nextgen] model_fit_count=0
+
+
+--- STDERR ---

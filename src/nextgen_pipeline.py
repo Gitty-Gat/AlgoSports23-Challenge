@@ -18,9 +18,13 @@ import pandas as pd
 from scipy import stats
 from scipy.optimize import minimize
 from sklearn.ensemble import GradientBoostingRegressor, HistGradientBoostingRegressor
-from sklearn.linear_model import HuberRegressor, Ridge
+from sklearn.linear_model import ElasticNet, HuberRegressor, Ridge
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+try:
+    from xgboost import XGBRegressor
+except Exception:  # pragma: no cover
+    XGBRegressor = None
 
 import matplotlib
 
@@ -64,7 +68,14 @@ META_EXCLUDE = {
     "Team2",
     "Team1_WinMargin",
 }
-MEAN_MODEL_COLS = ["pred_ridge", "pred_huber", "pred_histgb", "pred_histgb_bag"]
+MEAN_MODEL_COLS = ["pred_ridge", "pred_histgb", "pred_gbr", "pred_xgb", "pred_histgb_bag", "pred_enet_f2"]
+ETA_GRID = [0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
+REGIME_GATE_TAIL_DISP_MIN = 0.60
+REGIME_GATE_TAIL_IMPROVE_MIN = 1.0
+
+
+class BudgetExhaustedError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -82,16 +93,18 @@ class CoreCandidate:
 
 @dataclass(frozen=True)
 class PostprocessCandidate:
+    module_name: str
     regime_stack: bool
     calibration_mode: str
     scale_mode: str
     q50_blend: float
     winsor_q: float
+    eta: float
 
     def key(self) -> str:
         return (
-            f"stack={'reg' if self.regime_stack else 'pool'}|cal={self.calibration_mode}|"
-            f"scale={self.scale_mode}|q50={self.q50_blend:.2f}|win={self.winsor_q:.3f}"
+            f"module={self.module_name}|stack={'reg' if self.regime_stack else 'pool'}|cal={self.calibration_mode}|"
+            f"scale={self.scale_mode}|q50={self.q50_blend:.2f}|win={self.winsor_q:.3f}|eta={self.eta:.2f}"
         )
 
 
@@ -102,6 +115,7 @@ class PostprocessModel:
     stack_fit: dict
     cal_fit: dict
     scale_fit: dict
+    affine_fit: dict
     winsor_bounds: tuple[float, float]
     regime_summary: pd.DataFrame
     calibration_summary: pd.DataFrame
@@ -242,14 +256,57 @@ def _env_bool(name: str, default: bool) -> bool:
     return bool(default)
 
 
+def _env_csv_list(name: str, default: Sequence[str]) -> List[str]:
+    raw = os.environ.get(name)
+    if raw is None:
+        return [str(x) for x in default]
+    vals = [str(x).strip() for x in str(raw).split(",")]
+    vals = [v for v in vals if v]
+    return vals if vals else [str(x) for x in default]
+
+
+def _env_float_list(name: str, default: Sequence[float]) -> List[float]:
+    vals = _env_csv_list(name, [str(x) for x in default])
+    out: List[float] = []
+    for v in vals:
+        try:
+            out.append(float(v))
+        except Exception:
+            continue
+    return out if out else [float(x) for x in default]
+
+
+def _env_half_life_list(name: str, default: Sequence[Optional[int]]) -> List[Optional[int]]:
+    vals = _env_csv_list(
+        name,
+        [("none" if x is None else str(int(x))) for x in default],
+    )
+    out: List[Optional[int]] = []
+    for v in vals:
+        sv = str(v).strip().lower()
+        if sv in {"none", "null", "na"}:
+            out.append(None)
+            continue
+        try:
+            out.append(int(float(v)))
+        except Exception:
+            continue
+    return out if out else list(default)
+
+
+def _strict_budget_abort_enabled() -> bool:
+    return _env_bool("ALGOSPORTS_ABORT_ON_BUDGET_HIT", True)
+
+
 def _load_runtime_config_from_env() -> RuntimeConfig:
-    fast_mode = _env_bool("ALGOSPORTS_FAST_MODE", True)
+    fast_mode = _env_bool("ALGOSPORTS_FAST_MODE", False)
     enable_optimizations = _env_bool("ALGOSPORTS_ENABLE_OPTIMIZATIONS", True)
+    fit_default = _env_int("ALGOSPORTS_MAX_MODEL_FITS", 1000)
     bag_default = 1 if fast_mode else 2
     cfg = RuntimeConfig(
-        max_total_seconds=_env_int("ALGOSPORTS_MAX_TOTAL_SECONDS", 600),
-        max_scan_seconds=_env_int("ALGOSPORTS_MAX_SCAN_SECONDS", 120),
-        max_fits=_env_int("ALGOSPORTS_MAX_FITS", 400),
+        max_total_seconds=_env_int("ALGOSPORTS_MAX_TOTAL_SECONDS", 1200),
+        max_scan_seconds=_env_int("ALGOSPORTS_MAX_SCAN_SECONDS", 300),
+        max_fits=_env_int("ALGOSPORTS_MAX_FITS", fit_default),
         fast_mode=bool(fast_mode),
         enable_optimizations=bool(enable_optimizations),
         histgb_max_iter_cap=_env_int("ALGOSPORTS_FAST_HISTGB_MAX_ITER_CAP", 60),
@@ -414,6 +471,33 @@ def _reg_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
     resid = y_true - y_pred
+    abs_y = np.abs(y_true)
+    if len(abs_y):
+        q80 = float(np.quantile(abs_y, 0.80))
+        q90 = float(np.quantile(abs_y, 0.90))
+    else:
+        q80 = 0.0
+        q90 = 0.0
+    tail_mask = abs_y >= q80
+    xtail_mask = abs_y >= q90
+    if np.any(tail_mask):
+        tail_rmse = _rmse(y_true[tail_mask], y_pred[tail_mask])
+        tail_bias = _bias(y_true[tail_mask], y_pred[tail_mask])
+        tail_disp = float(np.std(y_pred[tail_mask]) / max(np.std(y_true[tail_mask]), 1e-9))
+    else:
+        tail_rmse = _rmse(y_true, y_pred)
+        tail_bias = _bias(y_true, y_pred)
+        tail_disp = 1.0
+    if np.any(xtail_mask):
+        xtail_rmse = _rmse(y_true[xtail_mask], y_pred[xtail_mask])
+    else:
+        xtail_rmse = tail_rmse
+    if len(y_true) >= 2 and float(np.std(y_true)) > 1e-12 and float(np.std(y_pred)) > 1e-12:
+        corr = float(np.corrcoef(y_true, y_pred)[0, 1])
+    else:
+        corr = 0.0
+    if not np.isfinite(corr):
+        corr = 0.0
     return {
         "rmse": _rmse(y_true, y_pred),
         "mae": _mae(y_true, y_pred),
@@ -421,6 +505,11 @@ def _reg_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
         "pred_std": float(np.std(y_pred)),
         "actual_std": float(np.std(y_true)),
         "resid_std": float(np.std(resid)),
+        "tail_rmse": float(tail_rmse),
+        "xtail_rmse": float(xtail_rmse),
+        "tail_bias": float(tail_bias),
+        "tail_dispersion_ratio": float(tail_disp),
+        "corr": float(corr),
     }
 
 
@@ -510,6 +599,23 @@ def _add_nonlinear_features(df: pd.DataFrame) -> pd.DataFrame:
         for k in knots:
             add_cols[f"{col}__hinge_gt_{k}"] = np.maximum(x - float(k), 0.0) / 50.0
             add_cols[f"{col}__hinge_lt_{k}"] = np.maximum(float(k) - x, 0.0) / 50.0
+    if _env_bool("ALGOSPORTS_ENABLE_INTERACTION_FEATURES", True):
+        pairs = [
+            ("offdef_net_diff", "oppadj_margin_diff"),
+            ("offdef_net_diff", "ema_margin_diff"),
+            ("offdef_net_diff", "trend_margin_last5_vs_season_diff"),
+            ("oppadj_margin_diff", "ema_margin_diff"),
+            ("oppadj_margin_diff", "massey_diff"),
+            ("ema_margin_diff", "massey_diff"),
+            ("trend_margin_last5_vs_season_diff", "consistency_ratio_diff"),
+            ("trend_oppadj_last5_vs_season_diff", "consistency_ratio_diff"),
+        ]
+        for a, b in pairs:
+            if a not in out.columns or b not in out.columns:
+                continue
+            xa = out[a].astype(float).to_numpy() / 50.0
+            xb = out[b].astype(float).to_numpy() / 50.0
+            add_cols[f"{a}__x__{b}"] = xa * xb
     if add_cols:
         out = pd.concat([out, pd.DataFrame(add_cols, index=out.index)], axis=1)
     return out
@@ -595,6 +701,27 @@ def _prepare_prediction_matrices(
     with _timed_phase("_prepare_prediction_matrices", detail="cache_miss"):
         X_train_df, y_train = _xy(train_df, feature_cols)
         X_val_df = val_df.reindex(columns=list(feature_cols), fill_value=0.0).astype(float)
+        prune_topk = _env_int("ALGOSPORTS_FEATURE_PRUNE_TOPK", 0)
+        if prune_topk > 0 and X_train_df.shape[1] > int(prune_topk):
+            y = np.asarray(y_train, dtype=float)
+            keep_rows = np.isfinite(y)
+            score: Dict[str, float] = {}
+            if np.any(keep_rows):
+                ys = y[keep_rows]
+                ysd = float(np.std(ys))
+                for c in X_train_df.columns:
+                    xv = X_train_df[c].to_numpy(dtype=float)[keep_rows]
+                    xsd = float(np.std(xv))
+                    if (not np.isfinite(xsd)) or xsd <= 1e-12 or (not np.isfinite(ysd)) or ysd <= 1e-12:
+                        score[str(c)] = 0.0
+                        continue
+                    cc = float(np.corrcoef(xv, ys)[0, 1])
+                    score[str(c)] = abs(cc) if np.isfinite(cc) else 0.0
+            ranked = sorted(score.items(), key=lambda kv: kv[1], reverse=True)
+            keep_cols = [k for k, _ in ranked[: int(prune_topk)]]
+            if keep_cols:
+                X_train_df = X_train_df.reindex(columns=keep_cols, fill_value=0.0)
+                X_val_df = X_val_df.reindex(columns=keep_cols, fill_value=0.0)
         sw = _compute_time_decay_weights(train_df["Date"], half_life_days)
         bundle = PreparedMatrixBundle(
             X_train=np.asarray(X_train_df.to_numpy(dtype=float), dtype=float),
@@ -612,7 +739,10 @@ def _make_pipeline_ridge(alpha: float, seed: int) -> Pipeline:
 
 
 def _make_pipeline_huber(seed: int) -> Pipeline:
-    return Pipeline([("scaler", StandardScaler()), ("model", HuberRegressor(alpha=0.001, epsilon=1.35, max_iter=2000))])
+    alpha = _env_float("ALGOSPORTS_HUBER_ALPHA", 0.001)
+    epsilon = _env_float("ALGOSPORTS_HUBER_EPSILON", 1.35)
+    max_iter = _env_int("ALGOSPORTS_HUBER_MAX_ITER", 2000)
+    return Pipeline([("scaler", StandardScaler()), ("model", HuberRegressor(alpha=float(alpha), epsilon=float(epsilon), max_iter=int(max_iter)))])
 
 
 def _make_histgb(params: Mapping[str, Any], seed: int, quantile: Optional[float] = None):
@@ -646,6 +776,38 @@ def _make_histgb(params: Mapping[str, Any], seed: int, quantile: Optional[float]
         )
 
 
+def _make_gbr(params: Mapping[str, Any], seed: int):
+    max_iter = int(params.get("max_iter", 300))
+    return GradientBoostingRegressor(
+        loss="squared_error",
+        learning_rate=float(params["learning_rate"]),
+        max_depth=int(params["max_depth"]),
+        min_samples_leaf=int(params["min_samples_leaf"]),
+        n_estimators=min(max(max_iter, 120), 600),
+        random_state=seed,
+    )
+
+
+def _make_xgb(params: Mapping[str, Any], seed: int):
+    if XGBRegressor is None:
+        raise RuntimeError("xgboost is unavailable")
+    max_iter = int(params.get("max_iter", 300))
+    return XGBRegressor(
+        objective="reg:squarederror",
+        n_estimators=min(max(int(max_iter * 2), 160), 1200),
+        learning_rate=float(params["learning_rate"]),
+        max_depth=max(2, int(params["max_depth"])),
+        min_child_weight=max(1.0, float(params.get("min_samples_leaf", 6))),
+        subsample=0.9,
+        colsample_bytree=0.9,
+        reg_alpha=0.0,
+        reg_lambda=max(0.0, float(params.get("l2_regularization", 0.0))) + 1.0,
+        random_state=int(seed),
+        n_jobs=1,
+        tree_method="hist",
+    )
+
+
 def _fit_model(estimator, X: Any, y: np.ndarray, sample_weight: Optional[np.ndarray]):
     if sample_weight is None:
         return estimator.fit(X, y)
@@ -666,7 +828,10 @@ def _budget_reserve_fit_or_false(family: str, n: int = 1) -> bool:
     b = _budget()
     if b is None:
         return True
-    return bool(b.try_reserve_fits(n=n, family=family))
+    ok = bool(b.try_reserve_fits(n=n, family=family))
+    if not ok and _strict_budget_abort_enabled():
+        raise BudgetExhaustedError(f"Fit budget exhausted before fitting family={family} (requested={int(n)}).")
+    return ok
 
 
 def _histgb_bag_seeds(seed: int, n_models: int) -> List[int]:
@@ -692,43 +857,78 @@ def _predict_families_bundle(
         y_train = prep.y_train
         X_val = prep.X_val
         sw = prep.sample_weight
+        if len(y_train):
+            q_lo, q_hi = np.quantile(y_train, [0.005, 0.995])
+            pad = max(10.0, 0.15 * float(q_hi - q_lo))
+            pred_lo, pred_hi = float(q_lo - pad), float(q_hi + pad)
+        else:
+            pred_lo, pred_hi = -160.0, 160.0
         out: Dict[str, np.ndarray] = {}
         cfg = _runtime_cfg()
         b = _budget()
         fits_remaining = b.remaining_fits() if b is not None else 10**9
         fam_seed_offsets = {
             "ridge": 0,
+            "enet_f2": 5,
             "huber": 10,
             "histgb": 20,
-            "histgb_bag": 30,
-            "histgb_q50": 40,
-            "histgb_q20": 50,
-            "histgb_q80": 60,
+            "gbr": 30,
+            "xgb": 35,
+            "histgb_bag": 40,
+            "histgb_q50": 50,
+            "histgb_q20": 60,
+            "histgb_q80": 70,
         }
 
         def fit_and_predict(one_family: str, est) -> np.ndarray:
             if not _budget_reserve_fit_or_false(one_family, 1):
-                return _safe_constant_fallback(y_train, len(X_val))
+                raise BudgetExhaustedError(f"Could not reserve fit budget for family={one_family}.")
             _record_model_fit_count(one_family)
             _fit_model(est, X_train, y_train, sw)
-            return np.asarray(est.predict(X_val), dtype=float)
+            p = np.asarray(est.predict(X_val), dtype=float)
+            return np.clip(p, pred_lo, pred_hi)
+
+        def fit_and_predict_enet_f2(one_family: str, fseed: int) -> np.ndarray:
+            f2_cols = [c for c in ["massey_diff", "elok_diff", "games_played_diff", "volatility_diff"] if c in train_df.columns and c in val_df.columns]
+            if not f2_cols:
+                return fit_and_predict(one_family, _make_pipeline_ridge(ridge_alpha, fseed))
+            if not _budget_reserve_fit_or_false(one_family, 1):
+                raise BudgetExhaustedError(f"Could not reserve fit budget for family={one_family}.")
+            _record_model_fit_count(one_family)
+            Xtr = train_df.reindex(columns=f2_cols, fill_value=0.0).to_numpy(dtype=float)
+            Xva = val_df.reindex(columns=f2_cols, fill_value=0.0).to_numpy(dtype=float)
+            est = ElasticNet(alpha=0.7, l1_ratio=0.12, random_state=int(fseed), max_iter=20000)
+            try:
+                est.fit(Xtr, y_train, sample_weight=sw)
+            except TypeError:
+                est.fit(Xtr, y_train)
+            p = np.asarray(est.predict(Xva), dtype=float)
+            return np.clip(p, pred_lo, pred_hi)
 
         for family in families:
             if family in out:
                 continue
             with _timed_phase("_predict_family", detail=family):
                 if _budget_total_exceeded() and len(out) > 0:
-                    out[family] = _safe_constant_fallback(y_train, len(X_val))
-                    continue
+                    raise BudgetExhaustedError("Total-time budget exhausted during family prediction.")
                 fam_seed = int(seed + int(fam_seed_offsets.get(family, 0)))
                 if family == "ridge":
                     out[family] = fit_and_predict(family, _make_pipeline_ridge(ridge_alpha, fam_seed))
+                    continue
+                if family == "enet_f2":
+                    out[family] = fit_and_predict_enet_f2(family, fam_seed)
                     continue
                 if family == "huber":
                     out[family] = fit_and_predict(family, _make_pipeline_huber(fam_seed))
                     continue
                 if family == "histgb":
                     out[family] = fit_and_predict(family, _make_histgb(histgb_params, fam_seed, None))
+                    continue
+                if family == "gbr":
+                    out[family] = fit_and_predict(family, _make_gbr(histgb_params, fam_seed))
+                    continue
+                if family == "xgb":
+                    out[family] = fit_and_predict(family, _make_xgb(histgb_params, fam_seed))
                     continue
                 if family == "histgb_q50":
                     out[family] = fit_and_predict(family, _make_histgb(histgb_params, fam_seed, 0.5))
@@ -755,11 +955,11 @@ def _predict_families_bundle(
                         _record_model_fit_count(family)
                         est = _make_histgb(histgb_params, int(s), None)
                         _fit_model(est, X_train, y_train, sw)
-                        preds.append(np.asarray(est.predict(X_val), dtype=float))
+                        preds.append(np.clip(np.asarray(est.predict(X_val), dtype=float), pred_lo, pred_hi))
                     if not preds:
-                        out[family] = _safe_constant_fallback(y_train, len(X_val))
+                        raise BudgetExhaustedError("Fit budget exhausted before HistGB bag could fit any model.")
                     else:
-                        out[family] = np.mean(np.column_stack(preds), axis=1)
+                        out[family] = np.clip(np.mean(np.column_stack(preds), axis=1), pred_lo, pred_hi)
                     continue
                 raise ValueError(family)
         return out
@@ -818,20 +1018,44 @@ def _load_inputs(paths: Mapping[str, Path]) -> Dict[str, pd.DataFrame]:
 
 
 def _build_elo_variants() -> Dict[str, EloVariantConfig]:
-    return {
+    variants = {
         "elo_base_static": EloVariantConfig(name="elo_base_static", home_adv=55.0, k_factor=24.0),
         "elo_dynamic_k": EloVariantConfig(name="elo_dynamic_k", home_adv=55.0, k_factor=22.0, use_dynamic_k=True, k_early_multiplier=0.9, k_games_scale=16.0, k_uncertainty_multiplier=0.30),
         "elo_dynamic_k_teamha": EloVariantConfig(name="elo_dynamic_k_teamha", home_adv=50.0, k_factor=22.0, use_dynamic_k=True, k_early_multiplier=0.9, k_games_scale=18.0, k_uncertainty_multiplier=0.25, use_team_home_adv=True, team_home_adv_scale=72.0, team_home_adv_reg=7.0, team_home_adv_cap=45.0),
         "elo_dynamic_k_teamha_decay": EloVariantConfig(name="elo_dynamic_k_teamha_decay", home_adv=50.0, k_factor=21.0, use_dynamic_k=True, k_early_multiplier=0.95, k_games_scale=18.0, k_uncertainty_multiplier=0.35, use_team_home_adv=True, team_home_adv_scale=70.0, team_home_adv_reg=8.0, team_home_adv_cap=45.0, use_inactivity_decay=True, inactivity_tau_days=95.0),
     }
+    only = _env_csv_list("ALGOSPORTS_ELO_VARIANTS", [])
+    if only:
+        keep = [k for k in only if k in variants]
+        if keep:
+            return {k: variants[k] for k in keep}
+    return variants
 
 
 def _histgb_param_grid() -> List[dict]:
-    return [
+    base = [
         {"learning_rate": 0.04, "max_depth": 3, "max_leaf_nodes": 31, "min_samples_leaf": 10, "l2_regularization": 0.3, "max_iter": 280},
         {"learning_rate": 0.05, "max_depth": 4, "max_leaf_nodes": 31, "min_samples_leaf": 8, "l2_regularization": 0.8, "max_iter": 360},
         {"learning_rate": 0.03, "max_depth": 4, "max_leaf_nodes": 63, "min_samples_leaf": 6, "l2_regularization": 1.2, "max_iter": 420},
+        {"learning_rate": 0.025, "max_depth": 5, "max_leaf_nodes": 63, "min_samples_leaf": 5, "l2_regularization": 1.5, "max_iter": 520},
+        {"learning_rate": 0.06, "max_depth": 3, "max_leaf_nodes": 31, "min_samples_leaf": 12, "l2_regularization": 0.4, "max_iter": 300},
     ]
+    level = max(1, _env_int("ALGOSPORTS_HISTGB_GRID_LEVEL", 2))
+    if level <= 1:
+        return base
+    extra = [
+        {"learning_rate": 0.07, "max_depth": 5, "max_leaf_nodes": 63, "min_samples_leaf": 4, "l2_regularization": 0.2, "max_iter": 520},
+        {"learning_rate": 0.05, "max_depth": 6, "max_leaf_nodes": 127, "min_samples_leaf": 3, "l2_regularization": 0.1, "max_iter": 700},
+        {"learning_rate": 0.08, "max_depth": 4, "max_leaf_nodes": 127, "min_samples_leaf": 5, "l2_regularization": 0.0, "max_iter": 500},
+    ]
+    if level >= 3:
+        extra.extend(
+            [
+                {"learning_rate": 0.045, "max_depth": 7, "max_leaf_nodes": 127, "min_samples_leaf": 2, "l2_regularization": 0.05, "max_iter": 820},
+                {"learning_rate": 0.065, "max_depth": 6, "max_leaf_nodes": 255, "min_samples_leaf": 2, "l2_regularization": 0.0, "max_iter": 680},
+            ]
+        )
+    return base + extra
 
 
 def _build_split_tables(
@@ -1008,7 +1232,17 @@ def _core_scan_score(
                 ph = _predict_family("histgb", tr, va, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 2)
             mr = _reg_metrics(y, pr)
             mh = _reg_metrics(y, ph)
-            rows.append({"fold": int(split["fold"]), "ridge_rmse": mr["rmse"], "histgb_rmse": mh["rmse"], "ridge_mae": mr["mae"], "histgb_mae": mh["mae"], "histgb_pred_std": mh["pred_std"], "actual_std": mh["actual_std"]})
+            rows.append(
+                {
+                    "fold": int(split["fold"]),
+                    "ridge_rmse": mr["rmse"],
+                    "histgb_rmse": mh["rmse"],
+                    "ridge_mae": mr["mae"],
+                    "histgb_mae": mh["mae"],
+                    "histgb_pred_std": mh["pred_std"],
+                    "actual_std": mh["actual_std"],
+                }
+            )
         if not rows:
             return {
                 "candidate_key": candidate.key(),
@@ -1020,6 +1254,10 @@ def _core_scan_score(
                 "scan_score": float("inf"),
                 "scan_histgb_rmse": float("inf"),
                 "scan_histgb_mae": float("inf"),
+                "scan_gbr_rmse": float("nan"),
+                "scan_gbr_mae": float("nan"),
+                "scan_huber_rmse": float("nan"),
+                "scan_huber_mae": float("nan"),
                 "scan_ridge_rmse": float("inf"),
                 "scan_ridge_mae": float("inf"),
                 "scan_pred_std_gap_histgb": float("nan"),
@@ -1042,6 +1280,10 @@ def _core_scan_score(
             "scan_score": float(score),
             "scan_histgb_rmse": float(fr["histgb_rmse"].mean()),
             "scan_histgb_mae": float(fr["histgb_mae"].mean()),
+            "scan_gbr_rmse": float("nan"),
+            "scan_gbr_mae": float("nan"),
+            "scan_huber_rmse": float("nan"),
+            "scan_huber_mae": float("nan"),
             "scan_ridge_rmse": float(fr["ridge_rmse"].mean()),
             "scan_ridge_mae": float(fr["ridge_mae"].mean()),
             "scan_pred_std_gap_histgb": float(fr["histgb_pred_std"].mean() - fr["actual_std"].mean()),
@@ -1056,13 +1298,33 @@ def _scan_and_select_core_candidates(
 ) -> tuple[List[CoreCandidate], pd.DataFrame]:
     with _timed_phase("_scan_and_select_core_candidates"):
         cfg = _runtime_cfg()
+        b = _budget()
         scan_start_elapsed = now_seconds()
         all_candidates: List[CoreCandidate] = []
+        half_life_grid = _env_half_life_list("ALGOSPORTS_HALF_LIFE_GRID", [None, 20, 40, 60])
+        ridge_alpha_grid = _env_float_list("ALGOSPORTS_RIDGE_ALPHA_GRID", [1.0, 2.0, 4.0, 8.0, 16.0])
+        feature_profiles = _env_csv_list("ALGOSPORTS_FEATURE_PROFILES", ["compact_recency", "full_recency"])
+        histgb_idx_values = list(range(len(histgb_grid)))
+        scan_return_top = int(cfg.scan_top_candidates_return)
+        scan_prune_topn = int(cfg.scan_prune_keep_top_n)
+        if b is not None and int(cfg.max_fits) > 0:
+            rem_ratio = float(b.remaining_fits()) / float(max(int(cfg.max_fits), 1))
+            if rem_ratio <= 0.10:
+                histgb_idx_values = histgb_idx_values[: max(1, min(2, len(histgb_idx_values)))]
+                scan_prune_topn = min(scan_prune_topn, 30)
+                scan_return_top = min(scan_return_top, 2)
+            elif rem_ratio <= 0.20:
+                histgb_idx_values = histgb_idx_values[: max(1, min(3, len(histgb_idx_values)))]
+                scan_prune_topn = min(scan_prune_topn, 50)
+                scan_return_top = min(scan_return_top, 3)
+            elif rem_ratio <= 0.40:
+                histgb_idx_values = histgb_idx_values[: max(1, min(5, len(histgb_idx_values)))]
+                scan_prune_topn = min(scan_prune_topn, 80)
         for v in outer_variant_data.keys():
-            for profile in ["no_extra_recency", "compact_recency", "full_recency"]:
-                for hl in [None, 30, 60]:
-                    for ra in [4.0, 16.0]:
-                        for hidx in range(len(histgb_grid)):
+            for profile in feature_profiles:
+                for hl in half_life_grid:
+                    for ra in ridge_alpha_grid:
+                        for hidx in histgb_idx_values:
                             all_candidates.append(CoreCandidate(v, profile, hl, ra, hidx))
 
         if not cfg.enable_optimizations:
@@ -1083,12 +1345,15 @@ def _scan_and_select_core_candidates(
                     break
             coarse_rows_df = pd.DataFrame(coarse_rows)
             if coarse_rows_df.empty:
+                if _strict_budget_abort_enabled():
+                    raise BudgetExhaustedError("No coarse scan candidates evaluated before budget stop.")
                 coarse_keep = [all_candidates[0]] if all_candidates else []
             else:
                 n_keep = max(
                     1,
                     min(
                         int(cfg.scan_prune_keep_top_n),
+                        int(scan_prune_topn),
                         int(math.ceil(float(cfg.scan_prune_keep_frac) * float(len(coarse_rows_df)))),
                     ),
                 )
@@ -1113,9 +1378,7 @@ def _scan_and_select_core_candidates(
         elif not coarse_rows_df.empty:
             scan_df = coarse_rows_df.copy()
         else:
-            # Guaranteed fallback candidate if budgets stopped everything.
-            fallback = all_candidates[0]
-            scan_df = pd.DataFrame([_core_scan_score(fallback, outer_variant_data[fallback.elo_variant], histgb_grid, seed=seed, split_limit=1)])
+            raise BudgetExhaustedError("No scan candidates evaluated before budget stop.")
         if not coarse_rows_df.empty and "scan_stage" in coarse_rows_df.columns:
             coarse_for_log = coarse_rows_df.copy()
             coarse_for_log["scan_stage"] = coarse_for_log.get("scan_stage", "coarse")
@@ -1125,11 +1388,11 @@ def _scan_and_select_core_candidates(
         scan_for_select = scan_df.copy()
         if "scan_stage" in scan_for_select.columns:
             scan_for_select = scan_for_select[scan_for_select["scan_stage"].astype(str) != "coarse"]
-        for _, r in scan_for_select.head(int(cfg.scan_top_candidates_return)).iterrows():
+        for _, r in scan_for_select.head(int(scan_return_top)).iterrows():
             hl = None if pd.isna(r["half_life_days"]) else int(r["half_life_days"])
             top_cands.append(CoreCandidate(str(r["elo_variant"]), str(r["feature_profile"]), hl, float(r["ridge_alpha"]), int(r["histgb_idx"])))
         if not top_cands:
-            for _, r in scan_df.head(int(cfg.scan_top_candidates_return)).iterrows():
+            for _, r in scan_df.head(int(scan_return_top)).iterrows():
                 hl = None if pd.isna(r["half_life_days"]) else int(r["half_life_days"])
                 top_cands.append(CoreCandidate(str(r["elo_variant"]), str(r["feature_profile"]), hl, float(r["ridge_alpha"]), int(r["histgb_idx"])))
         return top_cands, scan_df
@@ -1157,7 +1420,10 @@ def _assign_regimes(df: pd.DataFrame, thresholds: Mapping[str, Any]) -> pd.DataF
 
 
 def _fit_regime_simplex(prior: pd.DataFrame, pred_cols: Sequence[str], use_regime: bool) -> tuple[dict, pd.DataFrame]:
-    pooled_w = _optimize_simplex_weights(prior[list(pred_cols)].to_numpy(dtype=float), prior["y_true"].to_numpy(dtype=float))
+    if _env_bool("ALGOSPORTS_FORCE_EQUAL_SIMPLEX", False):
+        pooled_w = np.full(len(pred_cols), 1.0 / max(len(pred_cols), 1), dtype=float)
+    else:
+        pooled_w = _optimize_simplex_weights(prior[list(pred_cols)].to_numpy(dtype=float), prior["y_true"].to_numpy(dtype=float))
     fit = {"mode": "regime" if use_regime else "pooled", "pred_cols": list(pred_cols), "pooled": pooled_w, "full": {}, "simple": {}, "gap": {}}
     rows = [{"level": "pooled", "regime": "ALL", "n": len(prior), **{f"w_{c}": float(pooled_w[i]) for i, c in enumerate(pred_cols)}}]
     if not use_regime:
@@ -1193,6 +1459,9 @@ def _apply_regime_simplex(df: pd.DataFrame, fit: Mapping[str, Any]) -> np.ndarra
 
 
 def _fit_regime_calibration(prior: pd.DataFrame, raw_col: str, mode: str) -> tuple[dict, pd.DataFrame]:
+    if str(mode) == "none":
+        fit = {"mode": "none", "pooled": (0.0, 1.0), "full": {}, "simple": {}, "gap": {}}
+        return fit, pd.DataFrame([{"level": "pooled", "regime": "ALL", "n": len(prior), "intercept": 0.0, "slope": 1.0}])
     a, b = _fit_linear_calibration(prior[raw_col].to_numpy(dtype=float), prior["y_true"].to_numpy(dtype=float))
     fit = {"mode": mode, "pooled": (a, b), "full": {}, "simple": {}, "gap": {}}
     rows = [{"level": "pooled", "regime": "ALL", "n": len(prior), "intercept": a, "slope": b}]
@@ -1290,13 +1559,57 @@ def _fit_postprocess_on_prior(prior: pd.DataFrame, cand: PostprocessCandidate) -
     cal_pred = _apply_regime_calibration(prior_reg, raw_blend, cal_fit)
     prior_reg = prior_reg.assign(_cal=cal_pred)
     scale_fit, scale_summary = _fit_regime_scale(prior_reg, "_cal", cand.scale_mode)
+    scaled_pred = cal_pred.copy() if cand.scale_mode == "none" else _apply_regime_scale(prior_reg, cal_pred, scale_fit)
     y = prior_reg["y_true"].to_numpy(dtype=float)
+    y_sd = float(np.std(y, ddof=0))
+    p_sd = float(np.std(scaled_pred, ddof=0))
+    r_base = float(p_sd / max(y_sd, 1e-9))
+    naive_r = float(y_sd / max(p_sd, 1e-9))
+    if r_base < 0.90:
+        s_uncapped = max(1.0, float(cand.eta) * naive_r)
+    else:
+        s_uncapped = float(np.clip(naive_r, 0.95, 1.05))
+    s_cap = 1.65
+    if _env_bool("ALGOSPORTS_DISABLE_AFFINE_FIT", False):
+        s_uncapped = 1.0
+        s_cap = 1.0
+    s = float(min(float(s_uncapped), float(s_cap)))
+    a = float(np.mean(y) - s * np.mean(scaled_pred))
+    pred_affine = a + s * scaled_pred
+    gamma = 0.0
+    if str(cand.module_name) == "expand_regime_affine_v2_heterosk":
+        best = (float(_reg_metrics(y, pred_affine)["tail_rmse"]), 0.0)
+        key = np.log1p(np.abs(prior_reg["elo_diff_pre"].to_numpy(dtype=float)))
+        for g in [0.01, 0.02, 0.03, 0.05]:
+            p_try = a + (pred_affine - a) * (1.0 + float(g) * key)
+            tail_rmse = float(_reg_metrics(y, p_try)["tail_rmse"])
+            if tail_rmse + 1e-12 < best[0]:
+                best = (tail_rmse, float(g))
+        gamma = float(best[1])
     if float(cand.winsor_q) > 0:
         lo = float(np.quantile(y, float(cand.winsor_q)))
         hi = float(np.quantile(y, 1.0 - float(cand.winsor_q)))
     else:
         lo, hi = -np.inf, np.inf
-    fit = {"thresholds": thresholds, "stack_fit": stack_fit, "cal_fit": cal_fit, "scale_fit": scale_fit, "winsor_bounds": (lo, hi)}
+    affine_fit = {
+        "a": float(a),
+        "s": float(s),
+        "s_uncapped": float(s_uncapped),
+        "s_cap": float(s_cap),
+        "s_cap_hit": bool(float(s_uncapped) > float(s) + 1e-12),
+        "eta": float(cand.eta),
+        "r_base": float(r_base),
+        "naive_r": float(naive_r),
+        "gamma": float(gamma),
+    }
+    fit = {
+        "thresholds": thresholds,
+        "stack_fit": stack_fit,
+        "cal_fit": cal_fit,
+        "scale_fit": scale_fit,
+        "affine_fit": affine_fit,
+        "winsor_bounds": (lo, hi),
+    }
     return fit, stack_summary, cal_summary, scale_summary
 
 
@@ -1306,8 +1619,16 @@ def _apply_postprocess_fit(df: pd.DataFrame, fit: Mapping[str, Any], cand: Postp
     raw_blend = (1.0 - float(cand.q50_blend)) * raw_mean + float(cand.q50_blend) * dfr["pred_q50"].to_numpy(dtype=float)
     cal = _apply_regime_calibration(dfr, raw_blend, fit["cal_fit"])
     scaled = cal.copy() if cand.scale_mode == "none" else _apply_regime_scale(dfr, cal, fit["scale_fit"])
+    aff = dict(fit.get("affine_fit", {}) or {})
+    a = float(aff.get("a", 0.0))
+    s = float(aff.get("s", 1.0))
+    final = a + s * scaled
+    gamma = float(aff.get("gamma", 0.0))
+    if str(cand.module_name) == "expand_regime_affine_v2_heterosk" and gamma > 0:
+        key = np.log1p(np.abs(dfr["elo_diff_pre"].to_numpy(dtype=float)))
+        final = a + (final - a) * (1.0 + gamma * key)
     lo, hi = fit["winsor_bounds"]
-    final = np.clip(scaled, lo, hi)
+    final = np.clip(final, lo, hi)
     return {"raw_mean": raw_mean, "raw_blend": raw_blend, "calibrated": cal, "scaled": scaled, "final": final}
 
 
@@ -1319,6 +1640,7 @@ def _fit_postprocess_model(inner_oof: pd.DataFrame, cand: PostprocessCandidate) 
         stack_fit=fit["stack_fit"],
         cal_fit=fit["cal_fit"],
         scale_fit=fit["scale_fit"],
+        affine_fit=fit.get("affine_fit", {}),
         winsor_bounds=fit["winsor_bounds"],
         regime_summary=stack_summary,
         calibration_summary=cal_summary,
@@ -1332,34 +1654,47 @@ def _apply_postprocess_model(df: pd.DataFrame, model: PostprocessModel) -> Dict[
         "stack_fit": model.stack_fit,
         "cal_fit": model.cal_fit,
         "scale_fit": model.scale_fit,
+        "affine_fit": model.affine_fit,
         "winsor_bounds": model.winsor_bounds,
     }
     return _apply_postprocess_fit(df, fit, model.candidate)
 
 
 def _make_postprocess_grid() -> List[PostprocessCandidate]:
-    # Curated grid to keep nested runtime tractable while preserving required comparisons:
-    # pooled vs regime stack/calibration, no/pooled/regime scale, and mean-vs-median blending.
+    phase_run = str(os.environ.get("ALGOSPORTS_PHASE1_RUN", "run2")).strip().lower()
+    if phase_run == "run1":
+        default_modules = ["expand_affine_global"]
+    else:
+        default_modules = ["expand_affine_global", "expand_regime_affine_v2", "expand_regime_affine_v2_heterosk"]
+    modules = _env_csv_list("ALGOSPORTS_POST_MODULES", default_modules)
+    allowed = {"expand_affine_global", "expand_regime_affine_v2", "expand_regime_affine_v2_heterosk"}
+    modules = [m for m in modules if m in allowed]
+    if not modules:
+        modules = list(default_modules)
+    eta_values = _env_float_list("ALGOSPORTS_ETA_GRID", ETA_GRID)
     out: List[PostprocessCandidate] = []
-    templates = [
-        (False, "pooled", "none"),
-        (False, "pooled", "pooled"),
-        (True, "pooled", "pooled"),
-        (True, "regime", "pooled"),
-        (True, "regime", "regime"),
-    ]
-    for q50_blend in [0.0, 0.25]:
-        for winsor_q in [0.0, 0.01]:
-            for regime_stack, cal_mode, scale_mode in templates:
-                out.append(
-                    PostprocessCandidate(
-                        regime_stack=bool(regime_stack),
-                        calibration_mode=str(cal_mode),
-                        scale_mode=str(scale_mode),
-                        q50_blend=float(q50_blend),
-                        winsor_q=float(winsor_q),
+    for module in modules:
+        if module == "expand_affine_global":
+            default_global_cal = "none" if str(phase_run) == "run1" else "pooled"
+            regime_stack, cal_mode, scale_mode = False, str(os.environ.get("ALGOSPORTS_GLOBAL_CAL_MODE", default_global_cal)).strip().lower(), "none"
+        elif module == "expand_regime_affine_v2":
+            regime_stack, cal_mode, scale_mode = True, "pooled", "none"
+        else:
+            regime_stack, cal_mode, scale_mode = True, "pooled", "pooled"
+        for eta in eta_values:
+            for q50_blend in [0.0, 0.20]:
+                for winsor_q in [0.0, 0.01]:
+                    out.append(
+                        PostprocessCandidate(
+                            module_name=str(module),
+                            regime_stack=bool(regime_stack),
+                            calibration_mode=str(cal_mode),
+                            scale_mode=str(scale_mode),
+                            q50_blend=float(q50_blend),
+                            winsor_q=float(winsor_q),
+                            eta=float(eta),
+                        )
                     )
-                )
     return out
 
 
@@ -1402,7 +1737,7 @@ def _generate_inner_oof_and_outer_preds(
             base["y_true"] = y_val
             if cfg.enable_optimizations:
                 pred_bundle = _predict_families_bundle(
-                    ["ridge", "huber", "histgb", "histgb_bag", "histgb_q50"],
+                    ["ridge", "enet_f2", "huber", "histgb", "gbr", "xgb", "histgb_bag", "histgb_q50"],
                     tr,
                     va,
                     feature_cols,
@@ -1412,16 +1747,22 @@ def _generate_inner_oof_and_outer_preds(
                     seed=seed + 10,
                 )
                 base["pred_ridge"] = pred_bundle["ridge"]
+                base["pred_enet_f2"] = pred_bundle["enet_f2"]
                 base["pred_huber"] = pred_bundle["huber"]
                 base["pred_histgb"] = pred_bundle["histgb"]
+                base["pred_gbr"] = pred_bundle["gbr"]
+                base["pred_xgb"] = pred_bundle["xgb"]
                 base["pred_histgb_bag"] = pred_bundle["histgb_bag"]
                 base["pred_q50"] = pred_bundle["histgb_q50"]
             else:
                 base["pred_ridge"] = _predict_family("ridge", tr, va, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 10)
+                base["pred_enet_f2"] = _predict_family("enet_f2", tr, va, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 15)
                 base["pred_huber"] = _predict_family("huber", tr, va, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 20)
                 base["pred_histgb"] = _predict_family("histgb", tr, va, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 30)
-                base["pred_histgb_bag"] = _predict_family("histgb_bag", tr, va, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 40)
-                base["pred_q50"] = _predict_family("histgb_q50", tr, va, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 50)
+                base["pred_gbr"] = _predict_family("gbr", tr, va, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 40)
+                base["pred_xgb"] = _predict_family("xgb", tr, va, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 45)
+                base["pred_histgb_bag"] = _predict_family("histgb_bag", tr, va, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 50)
+                base["pred_q50"] = _predict_family("histgb_q50", tr, va, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 60)
             inner_rows.append(base)
         inner_oof = pd.concat(inner_rows, ignore_index=True) if inner_rows else pd.DataFrame()
 
@@ -1448,7 +1789,7 @@ def _generate_inner_oof_and_outer_preds(
         outer_pred_df["y_true"] = va_outer["HomeWinMargin"].to_numpy(dtype=float)
         if cfg.enable_optimizations:
             outer_bundle = _predict_families_bundle(
-                ["ridge", "huber", "histgb", "histgb_bag", "histgb_q50"],
+                ["ridge", "enet_f2", "huber", "histgb", "gbr", "xgb", "histgb_bag", "histgb_q50"],
                 tr_full,
                 va_outer,
                 feature_cols,
@@ -1458,16 +1799,22 @@ def _generate_inner_oof_and_outer_preds(
                 seed=seed + 110,
             )
             outer_pred_df["pred_ridge"] = outer_bundle["ridge"]
+            outer_pred_df["pred_enet_f2"] = outer_bundle["enet_f2"]
             outer_pred_df["pred_huber"] = outer_bundle["huber"]
             outer_pred_df["pred_histgb"] = outer_bundle["histgb"]
+            outer_pred_df["pred_gbr"] = outer_bundle["gbr"]
+            outer_pred_df["pred_xgb"] = outer_bundle["xgb"]
             outer_pred_df["pred_histgb_bag"] = outer_bundle["histgb_bag"]
             outer_pred_df["pred_q50"] = outer_bundle["histgb_q50"]
         else:
             outer_pred_df["pred_ridge"] = _predict_family("ridge", tr_full, va_outer, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 110)
+            outer_pred_df["pred_enet_f2"] = _predict_family("enet_f2", tr_full, va_outer, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 115)
             outer_pred_df["pred_huber"] = _predict_family("huber", tr_full, va_outer, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 120)
             outer_pred_df["pred_histgb"] = _predict_family("histgb", tr_full, va_outer, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 130)
-            outer_pred_df["pred_histgb_bag"] = _predict_family("histgb_bag", tr_full, va_outer, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 140)
-            outer_pred_df["pred_q50"] = _predict_family("histgb_q50", tr_full, va_outer, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 150)
+            outer_pred_df["pred_gbr"] = _predict_family("gbr", tr_full, va_outer, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 140)
+            outer_pred_df["pred_xgb"] = _predict_family("xgb", tr_full, va_outer, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 145)
+            outer_pred_df["pred_histgb_bag"] = _predict_family("histgb_bag", tr_full, va_outer, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 150)
+            outer_pred_df["pred_q50"] = _predict_family("histgb_q50", tr_full, va_outer, feature_cols, ridge_alpha=candidate.ridge_alpha, histgb_params=histgb_params, half_life_days=candidate.half_life_days, seed=seed + 160)
         return inner_oof, outer_pred_df
 
 
@@ -1475,6 +1822,8 @@ def _evaluate_postprocess_progressive(inner_oof: pd.DataFrame, cand: Postprocess
     if inner_oof is None or inner_oof.empty:
         empty_metrics = {
             "candidate_key": cand.key(),
+            "module_name": cand.module_name,
+            "eta": cand.eta,
             "rmse_final": float("inf"),
             "mae_final": float("inf"),
             "bias_final": 0.0,
@@ -1486,6 +1835,14 @@ def _evaluate_postprocess_progressive(inner_oof: pd.DataFrame, cand: Postprocess
             "pred_std_final": 0.0,
             "actual_std": 0.0,
             "dispersion_ratio": 1.0,
+            "tail_rmse_final": float("inf"),
+            "tail_bias_final": 0.0,
+            "tail_dispersion_ratio_final": 1.0,
+            "corr_final": 0.0,
+            "tail_improve_vs_raw": 0.0,
+            "cap_hit_rate": 0.0,
+            "invalid_gate": True,
+            "invalid_reason": "empty_inner_oof",
         }
         return empty_metrics, pd.DataFrame(), pd.DataFrame(columns=["row_index", "fold", "y_true", "pred_q50", "pred_raw_mean", "pred_raw_blend", "pred_calibrated", "pred_scaled", "pred_final"])
     df = inner_oof.sort_values(["fold", "row_index"], kind="mergesort").reset_index(drop=True)
@@ -1527,6 +1884,7 @@ def _evaluate_postprocess_progressive(inner_oof: pd.DataFrame, cand: Postprocess
         fold_rows.append(
             {
                 "candidate_key": cand.key(),
+                "module_name": cand.module_name,
                 "fold": int(fold_id),
                 "source": source,
                 "n_val": int(len(val)),
@@ -1536,12 +1894,36 @@ def _evaluate_postprocess_progressive(inner_oof: pd.DataFrame, cand: Postprocess
                 "pred_std_final": float(np.std(final)),
                 "pred_std_cal": float(np.std(cal)),
                 "actual_std": float(np.std(yv)),
+                "tail_rmse": float(_reg_metrics(yv, final)["tail_rmse"]),
+                "tail_bias": float(_reg_metrics(yv, final)["tail_bias"]),
+                "tail_dispersion_ratio": float(_reg_metrics(yv, final)["tail_dispersion_ratio"]),
+                "corr": float(_reg_metrics(yv, final)["corr"]),
             }
         )
 
     y = df["y_true"].to_numpy(dtype=float)
+    met_final = _reg_metrics(y, final_pred)
+    met_raw = _reg_metrics(y, raw_mean_all)
+    tail_improve = float(met_raw["tail_rmse"] - met_final["tail_rmse"])
+    rmse_improve = float(met_raw["rmse"] - met_final["rmse"])
+    invalid_gate = False
+    invalid_reason = ""
+    if str(cand.module_name) in {"expand_regime_affine_v2", "expand_regime_affine_v2_heterosk"}:
+        if float(met_final["tail_dispersion_ratio"]) < float(REGIME_GATE_TAIL_DISP_MIN) and float(tail_improve) < float(REGIME_GATE_TAIL_IMPROVE_MIN):
+            invalid_gate = True
+            invalid_reason = "blowout_taildisp_gate_relaxed"
+    if rmse_improve < -0.25:
+        invalid_gate = True
+        invalid_reason = "rmse_regress_vs_raw"
+    cap_hit_rate = 0.0
+    if float(cand.winsor_q) > 0:
+        lo = float(np.quantile(y, float(cand.winsor_q)))
+        hi = float(np.quantile(y, 1.0 - float(cand.winsor_q)))
+        cap_hit_rate = float(np.mean((final_pred <= lo + 1e-9) | (final_pred >= hi - 1e-9)))
     metrics = {
         "candidate_key": cand.key(),
+        "module_name": cand.module_name,
+        "eta": cand.eta,
         "rmse_final": _rmse(y, final_pred),
         "mae_final": _mae(y, final_pred),
         "bias_final": _bias(y, final_pred),
@@ -1553,6 +1935,15 @@ def _evaluate_postprocess_progressive(inner_oof: pd.DataFrame, cand: Postprocess
         "pred_std_final": float(np.std(final_pred)),
         "actual_std": float(np.std(y)),
         "dispersion_ratio": float(np.std(final_pred) / max(np.std(y), 1e-9)),
+        "tail_rmse_final": float(met_final["tail_rmse"]),
+        "tail_bias_final": float(met_final["tail_bias"]),
+        "tail_dispersion_ratio_final": float(met_final["tail_dispersion_ratio"]),
+        "corr_final": float(met_final["corr"]),
+        "tail_improve_vs_raw": float(tail_improve),
+        "rmse_improve_vs_raw": float(rmse_improve),
+        "cap_hit_rate": float(cap_hit_rate),
+        "invalid_gate": bool(invalid_gate),
+        "invalid_reason": str(invalid_reason),
     }
     pred_rows = df[["row_index", "fold", "y_true", "pred_q50"]].copy()
     pred_rows["pred_raw_mean"] = raw_mean_all
@@ -1577,17 +1968,20 @@ def _select_postprocess(inner_oof: pd.DataFrame, post_grid: Sequence[Postprocess
         if _runtime_cfg().fast_mode and i + 1 >= int(_runtime_cfg().fast_post_grid_limit):
             break
     if not metric_rows:
-        fallback = post_grid[0]
-        m, f, p = _evaluate_postprocess_progressive(inner_oof, fallback)
-        metric_rows.append(m)
-        fold_rows.append(f)
-        pred_map[fallback.key()] = p
+        raise BudgetExhaustedError("No postprocess candidates evaluated before budget stop.")
     metric_df = pd.DataFrame(metric_rows)
+    denom = metric_df["rmse_final"].clip(lower=1e-9)
     metric_df["selection_score"] = (
         metric_df["rmse_final"]
-        + 0.18 * metric_df["mae_final"]
-        + 0.12 * metric_df["bias_final"].abs()
+        + 0.10 * metric_df["mae_final"]
+        + 0.08 * metric_df["bias_final"].abs()
         + 0.10 * (metric_df["dispersion_ratio"] - 1.0).abs()
+        + 0.18 * (metric_df["tail_rmse_final"] / denom)
+        + 0.06 * metric_df["tail_bias_final"].abs()
+        + 0.10 * (metric_df["tail_dispersion_ratio_final"] - 1.0).abs()
+        + 0.10 * (1.0 - metric_df["corr_final"]).abs()
+        + 0.03 * metric_df["cap_hit_rate"]
+        + metric_df["invalid_gate"].astype(float) * 1000.0
     )
     metric_df = metric_df.sort_values(["selection_score", "rmse_final", "mae_final"], kind="mergesort").reset_index(drop=True)
     best_key = str(metric_df.iloc[0]["candidate_key"])
@@ -1856,10 +2250,12 @@ def _write_run_report(
     budget: Optional[BudgetController],
     timing_summary: Mapping[str, Any],
     selected_summary: Mapping[str, Any],
+    selected_features: Optional[Sequence[str]] = None,
     outer_rmse: float,
     outer_mae: float,
     predictions_out: pd.DataFrame,
     rankings_out: pd.DataFrame,
+    phase_metrics: Optional[Mapping[str, float]] = None,
 ) -> None:
     focus_phases = [
         "_scan_and_select_core_candidates",
@@ -1928,8 +2324,23 @@ def _write_run_report(
     lines.append(f"- Selected model family: {selected_summary.get('model_family')}")
     lines.append(f"- Selected Elo variant: {selected_summary.get('elo_variant')}")
     lines.append(f"- Feature profile / half-life: {selected_summary.get('feature_profile')} / {selected_summary.get('half_life_days')}")
+    lines.append(f"- Selected postprocess module: {selected_summary.get('module_name')}")
+    lines.append(f"- Selected ETA: {selected_summary.get('eta')}")
     lines.append(f"- Calibration / scale / regime stack: {selected_summary.get('calibration_mode')} / {selected_summary.get('scale_mode')} / {selected_summary.get('use_regime_stack')}")
     lines.append(f"- Nested outer RMSE / MAE: {outer_rmse:.5f} / {outer_mae:.5f}")
+    if phase_metrics:
+        lines.append("- Phase metrics:")
+        lines.append(f"  - mean_rmse={float(phase_metrics.get('mean_rmse', np.nan)):.6f}")
+        lines.append(f"  - corr={float(phase_metrics.get('corr', np.nan)):.6f}")
+        lines.append(f"  - mean_tail_dispersion={float(phase_metrics.get('mean_tail_dispersion', np.nan)):.6f}")
+        lines.append(f"  - mean_tail_bias={float(phase_metrics.get('mean_tail_bias', np.nan)):.6f}")
+        lines.append(f"  - fold2_rmse={float(phase_metrics.get('fold2_rmse', np.nan)):.6f}")
+        lines.append(f"  - cap_hit_rate={float(phase_metrics.get('cap_hit_rate', np.nan)):.6f}")
+    lines.append("- Regime gate change applied: tail_dispersion < 0.60 and tail_improve < 1.0 => invalid.")
+    lines.append(f"- ETA grid evaluated: {', '.join([f'{x:.2f}' for x in ETA_GRID])}")
+    if selected_features is not None:
+        lines.append(f"- Selected feature count: {len(selected_features)}")
+        lines.append(f"- Selected feature list: {', '.join([str(x) for x in selected_features])}")
     lines.append("")
     lines.append("## Sanity Checks")
     pred_num = pd.to_numeric(predictions_out.get('Team1_WinMargin'), errors='coerce') if "Team1_WinMargin" in predictions_out.columns else pd.Series(dtype=float)
@@ -1991,6 +2402,7 @@ def _build_report(
                 f"- Selected model family: {selected_summary.get('model_family')}",
                 f"- Selected Elo variant: {selected_summary.get('elo_variant')}",
                 f"- Nested outer RMSE/MAE: {outer_rmse:.3f} / {outer_mae:.3f}",
+                f"- Selected postprocess module/eta: {selected_summary.get('module_name')} / {selected_summary.get('eta')}",
                 f"- Calibration={selected_summary.get('calibration_mode')} | Scale={selected_summary.get('scale_mode')} | Regime stack={selected_summary.get('use_regime_stack')}",
                 f"- Runtime safety: fast_mode={selected_summary.get('fast_mode')} | budget_triggered={selected_summary.get('budget_triggered')}",
             ],
@@ -2007,7 +2419,7 @@ def _build_report(
         lines = [
             "2. What changed vs previous pipeline",
             "- Nested tuning for post-model layers and key hyperparameters (Ridge alpha, HistGB grid, recency half-life).",
-            "- Regime-specific simplex stacking + regime-specific calibration + regime/pool scale correction with fallback.",
+            "- Regime-specific simplex stacking + regime-specific calibration + regime/pool scale correction.",
             "- Recency features: EMA multi-alpha, last3/5/8, trend, consistency ratio.",
             "- Upgraded Elo variants: dynamic-K, team-specific regularized home effect, inactivity decay.",
             "- HistGB seed bagging and quantile HistGB (median, plus q20/q80 for diagnostics).",
@@ -2182,14 +2594,17 @@ def _prepare_full_derby_predictions(
     derby_pred_df["row_index"] = derby_nl.index.to_numpy()
     family_spec = [
         ("ridge", "pred_ridge", 10),
+        ("enet_f2", "pred_enet_f2", 15),
         ("huber", "pred_huber", 20),
         ("histgb", "pred_histgb", 30),
-        ("histgb_bag", "pred_histgb_bag", 40),
-        ("histgb_q50", "pred_q50", 50),
+        ("gbr", "pred_gbr", 40),
+        ("xgb", "pred_xgb", 45),
+        ("histgb_bag", "pred_histgb_bag", 50),
+        ("histgb_q50", "pred_q50", 60),
     ]
     cfg = _runtime_cfg()
     if not (cfg.fast_mode and cfg.fast_disable_q20_q80):
-        family_spec.extend([("histgb_q20", "pred_q20", 60), ("histgb_q80", "pred_q80", 70)])
+        family_spec.extend([("histgb_q20", "pred_q20", 70), ("histgb_q80", "pred_q80", 80)])
     if cfg.enable_optimizations:
         fams = [fam for fam, _, _ in family_spec]
         preds = _predict_families_bundle(
@@ -2226,6 +2641,18 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
     warnings.filterwarnings("ignore", category=RuntimeWarning)
     _set_deterministic(seed)
     runtime_cfg = _load_runtime_config_from_env()
+    raw_budget_env = {
+        "ALGOSPORTS_MAX_MODEL_FITS": os.environ.get("ALGOSPORTS_MAX_MODEL_FITS"),
+        "ALGOSPORTS_MAX_FITS": os.environ.get("ALGOSPORTS_MAX_FITS"),
+        "ALGOSPORTS_MAX_TOTAL_SECONDS": os.environ.get("ALGOSPORTS_MAX_TOTAL_SECONDS"),
+        "ALGOSPORTS_MAX_SCAN_SECONDS": os.environ.get("ALGOSPORTS_MAX_SCAN_SECONDS"),
+    }
+    print(
+        "[nextgen] Resolved Budget Config: "
+        f"max_total_seconds={int(runtime_cfg.max_total_seconds)}, "
+        f"max_scan_seconds={int(runtime_cfg.max_scan_seconds)}, "
+        f"max_fits={int(runtime_cfg.max_fits)} | raw_env={raw_budget_env}"
+    )
     prev_profiler = _ACTIVE_PROFILER
     prev_runtime_cfg = _ACTIVE_RUNTIME_CFG
     prev_budget = _ACTIVE_BUDGET
@@ -2268,7 +2695,7 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
         seq_by_variant_train[name] = seq_copy
 
     histgb_grid = _histgb_param_grid()
-    outer_n_folds = int(runtime_cfg.fast_outer_folds) if runtime_cfg.fast_mode else 4
+    outer_n_folds = int(runtime_cfg.fast_outer_folds) if runtime_cfg.fast_mode else 5
     outer_folds = make_expanding_time_folds(train_df, n_folds=outer_n_folds)
 
     outer_results = []
@@ -2326,11 +2753,13 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
             outer_metrics = _reg_metrics(y_outer, outer_applied["final"])
 
             pooled_comp = PostprocessCandidate(
+                module_name="expand_affine_global",
                 regime_stack=False,
                 calibration_mode="pooled",
                 scale_mode="pooled" if best_post.scale_mode != "none" else "none",
                 q50_blend=best_post.q50_blend,
                 winsor_q=best_post.winsor_q,
+                eta=best_post.eta,
             )
             pooled_model = _fit_postprocess_model(inner_oof, pooled_comp)
             pooled_outer = _apply_postprocess_model(outer_val_base, pooled_model)
@@ -2345,13 +2774,25 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
                 "ridge_alpha": cand.ridge_alpha,
                 "histgb_idx": cand.histgb_idx,
                 "inner_best_post_key": best_post.key(),
+                "module_name": best_post.module_name,
+                "eta": float(best_post.eta),
                 "inner_post_rmse": float(post_metric_df.iloc[0]["rmse_final"]),
                 "inner_post_mae": float(post_metric_df.iloc[0]["mae_final"]),
+                "inner_post_tail_rmse": float(post_metric_df.iloc[0]["tail_rmse_final"]),
+                "inner_post_tail_dispersion_ratio": float(post_metric_df.iloc[0]["tail_dispersion_ratio_final"]),
+                "inner_post_tail_bias": float(post_metric_df.iloc[0]["tail_bias_final"]),
+                "inner_post_corr": float(post_metric_df.iloc[0]["corr_final"]),
+                "inner_post_cap_hit_rate": float(post_metric_df.iloc[0]["cap_hit_rate"]),
+                "inner_post_invalid_gate": bool(post_metric_df.iloc[0]["invalid_gate"]),
                 "inner_mean_stack_rmse": float(post_metric_df.iloc[0]["rmse_mean_stack"]),
                 "inner_q50_rmse": float(post_metric_df.iloc[0]["rmse_q50"]),
                 "outer_rmse": outer_metrics["rmse"],
                 "outer_mae": outer_metrics["mae"],
                 "outer_bias": outer_metrics["bias"],
+                "outer_tail_rmse": outer_metrics["tail_rmse"],
+                "outer_tail_dispersion_ratio": outer_metrics["tail_dispersion_ratio"],
+                "outer_tail_bias": outer_metrics["tail_bias"],
+                "outer_corr": outer_metrics["corr"],
                 "outer_pred_std": outer_metrics["pred_std"],
                 "outer_actual_std": outer_metrics["actual_std"],
                 "outer_dispersion_ratio": outer_metrics["pred_std"] / max(outer_metrics["actual_std"], 1e-9),
@@ -2362,6 +2803,7 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
                 "scale_mode": best_post.scale_mode,
                 "q50_blend": float(best_post.q50_blend),
                 "winsor_q": float(best_post.winsor_q),
+                "outer_s_cap_hit": bool(post_model.affine_fit.get("s_cap_hit", False)),
             }
             eval_rows.append(row)
             postprocess_metric_rows.append(post_metric_df.assign(outer_fold=int(ofold["fold"]), core_candidate_key=cand.key()))
@@ -2464,8 +2906,18 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
         else pd.DataFrame()
     )
     postprocess_compare = (
-        outer_results_df.groupby(["use_regime_stack", "calibration_mode", "scale_mode"], as_index=False)
-        .agg(outer_rmse_mean=("outer_rmse", "mean"), outer_mae_mean=("outer_mae", "mean"), outer_dispersion_ratio_mean=("outer_dispersion_ratio", "mean"), regime_gain_vs_pooled_mean=("outer_regime_gain_vs_pooled", "mean"), n=("outer_fold", "count"))
+        outer_results_df.groupby(["module_name", "use_regime_stack", "calibration_mode", "scale_mode", "eta"], as_index=False)
+        .agg(
+            outer_rmse_mean=("outer_rmse", "mean"),
+            outer_mae_mean=("outer_mae", "mean"),
+            outer_tail_rmse_mean=("outer_tail_rmse", "mean"),
+            outer_tail_dispersion_ratio_mean=("outer_tail_dispersion_ratio", "mean"),
+            outer_tail_bias_mean=("outer_tail_bias", "mean"),
+            outer_corr_mean=("outer_corr", "mean"),
+            outer_dispersion_ratio_mean=("outer_dispersion_ratio", "mean"),
+            regime_gain_vs_pooled_mean=("outer_regime_gain_vs_pooled", "mean"),
+            n=("outer_fold", "count"),
+        )
         .sort_values(["outer_rmse_mean", "outer_mae_mean"], kind="mergesort")
         .reset_index(drop=True)
         if not outer_results_df.empty
@@ -2518,8 +2970,16 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
                 "ridge_alpha": cand.ridge_alpha,
                 "histgb_idx": cand.histgb_idx,
                 "postprocess_key": best_post.key(),
+                "module_name": best_post.module_name,
+                "eta": float(best_post.eta),
                 "inner_rmse_final": float(post_metric_df.iloc[0]["rmse_final"]),
                 "inner_mae_final": float(post_metric_df.iloc[0]["mae_final"]),
+                "inner_tail_rmse_final": float(post_metric_df.iloc[0]["tail_rmse_final"]),
+                "inner_tail_dispersion_ratio_final": float(post_metric_df.iloc[0]["tail_dispersion_ratio_final"]),
+                "inner_tail_bias_final": float(post_metric_df.iloc[0]["tail_bias_final"]),
+                "inner_corr_final": float(post_metric_df.iloc[0]["corr_final"]),
+                "inner_cap_hit_rate": float(post_metric_df.iloc[0]["cap_hit_rate"]),
+                "inner_invalid_gate": bool(post_metric_df.iloc[0]["invalid_gate"]),
                 "inner_rmse_q50": float(post_metric_df.iloc[0]["rmse_q50"]),
                 "inner_rmse_mean_stack": float(post_metric_df.iloc[0]["rmse_mean_stack"]),
                 "use_regime_stack": bool(best_post.regime_stack),
@@ -2539,50 +2999,7 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
             "post_fold_diag": post_fold_diag,
         }
     if not final_eval_rows:
-        # Hard fallback under severe budget pressure: use first scanned core candidate with a simple pooled postprocess.
-        fallback_core = final_top_core[0]
-        inner_oof, _ = _generate_inner_oof_and_outer_preds(fallback_core, final_variant_data[fallback_core.elo_variant], histgb_grid, seed=seed + 8000)
-        fallback_post = PostprocessCandidate(regime_stack=False, calibration_mode="pooled", scale_mode="none", q50_blend=0.0, winsor_q=0.0)
-        post_model = _fit_postprocess_model(inner_oof, fallback_post) if not inner_oof.empty else PostprocessModel(
-            candidate=fallback_post,
-            thresholds={"elo_cuts": [35.0, 90.0], "vol_cut": 0.0, "info_cut": 5.0, "info_hi_cut": 8.0},
-            stack_fit={"mode": "pooled", "pred_cols": MEAN_MODEL_COLS, "pooled": np.array([0.25, 0.25, 0.25, 0.25]), "full": {}, "simple": {}, "gap": {}},
-            cal_fit={"mode": "pooled", "pooled": (0.0, 1.0), "full": {}, "simple": {}, "gap": {}},
-            scale_fit={"mode": "none", "center": 0.0, "pooled": 1.0, "full": {}, "simple": {}, "gap": {}},
-            winsor_bounds=(-np.inf, np.inf),
-            regime_summary=pd.DataFrame(),
-            calibration_summary=pd.DataFrame(),
-            scale_summary=pd.DataFrame(),
-        )
-        final_eval_rows.append(
-            {
-                "core_candidate_key": fallback_core.key(),
-                "elo_variant": fallback_core.elo_variant,
-                "feature_profile": fallback_core.feature_profile,
-                "half_life_days": np.nan if fallback_core.half_life_days is None else fallback_core.half_life_days,
-                "ridge_alpha": fallback_core.ridge_alpha,
-                "histgb_idx": fallback_core.histgb_idx,
-                "postprocess_key": fallback_post.key(),
-                "inner_rmse_final": float("inf"),
-                "inner_mae_final": float("inf"),
-                "inner_rmse_q50": float("inf"),
-                "inner_rmse_mean_stack": float("inf"),
-                "use_regime_stack": bool(fallback_post.regime_stack),
-                "calibration_mode": fallback_post.calibration_mode,
-                "scale_mode": fallback_post.scale_mode,
-                "q50_blend": fallback_post.q50_blend,
-                "winsor_q": fallback_post.winsor_q,
-            }
-        )
-        final_bundle_lookup[fallback_core.key()] = {
-            "candidate": fallback_core,
-            "inner_oof": inner_oof,
-            "best_post": fallback_post,
-            "post_model": post_model,
-            "best_post_pred_rows": pd.DataFrame({"fold": [], "row_index": [], "pred_final": []}),
-            "post_metric_df": pd.DataFrame(final_eval_rows),
-            "post_fold_diag": pd.DataFrame(),
-        }
+        raise BudgetExhaustedError("No final candidate/postprocess combination evaluated before budget stop.")
     final_eval_df = pd.DataFrame(final_eval_rows).sort_values(["inner_rmse_final", "inner_mae_final"], kind="mergesort").reset_index(drop=True)
     final_core_key = str(final_eval_df.iloc[0]["core_candidate_key"])
     final_sel = final_bundle_lookup[final_core_key]
@@ -2602,6 +3019,7 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
         seed=seed + 9000,
     )
     derby_pred_df = derby_pred_bundle["derby_pred_df"]
+    selected_feature_cols = _feature_profile_columns(_select_feature_columns(train_nl_selected), final_core_candidate.feature_profile)
 
     shift_table = _shift_diagnostics(train_nl_selected, derby_nl_selected)
     shift_mitigation_notes: List[str] = []
@@ -2647,6 +3065,7 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
     pred_out = pred_raw.copy()
     pred_out["Team1_WinMargin"] = final_derby_int
     pred_out.to_csv(root / "predictions.csv", index=False)
+    pred_out.to_csv(root / "Predictions.csv", index=False)
 
     selected_seq_build = seq_builds[final_core_candidate.elo_variant]
     recent_form_map = _extract_recent_form_map(selected_seq_build.final_states)
@@ -2668,6 +3087,7 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
         weights=ranking_weights,
     )
     rankings_out.to_excel(root / "rankings.xlsx", index=False)
+    rankings_out.to_excel(root / "Rankings.xlsx", index=False)
 
     # Build report inputs.
     prediction_head = pred_out.head(10).copy()
@@ -2686,6 +3106,8 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
             {"name": "histgb_idx", "value": final_core_candidate.histgb_idx},
             {"name": "histgb_params", "value": str(final_histgb_params)},
             {"name": "postprocess", "value": final_sel["best_post"].key()},
+            {"name": "postprocess_module", "value": final_sel["best_post"].module_name},
+            {"name": "postprocess_eta", "value": float(final_sel["best_post"].eta)},
             {"name": "winsor_bounds", "value": str(tuple(round(float(x), 4) for x in final_post_model.winsor_bounds))},
             {"name": "dispersion_guard_factor", "value": dispersion_guard_factor},
             {"name": "seed", "value": int(seed)},
@@ -2714,7 +3136,7 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
     runtime_notes = [
         "Profile-first instrumentation added for hotspot phase totals, per-family _predict_family timing, model fit counts, and top slow events.",
         "Shared split-level matrix/weight cache keyed by train/val index signatures + feature signature + half-life to eliminate repeated _xy/time-weight prep.",
-        "Bundled family prediction path prepares X/y/w once per split and fits Ridge/Huber/HistGB/HistGB-bag/q50 sequentially.",
+        "Bundled family prediction path prepares X/y/w once per split and fits Ridge/Huber/HistGB/GBR/XGB/HistGB-bag/q50 sequentially.",
         f"HistGB bagging reduced to {runtime_cfg.histgb_bag_n_models} models by default (fast mode uses 1), with deterministic seed schedule and budget-aware auto-reduction.",
         "Candidate scan uses conservative early pruning: coarse score on first inner split, then full evaluation on top candidates only.",
         "Budget enforcement: total time, scan time, and fit cap stop further scanning/training and continue with best-so-far.",
@@ -2749,10 +3171,12 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
         rankings_out=rankings_out.copy(),
         prediction_head=prediction_head.copy(),
         selected_summary={
-            "model_family": "Regime-aware simplex stack (Ridge/Huber/HistGB/HistGB-bag) + q50 blend",
+            "model_family": "Regime-aware simplex stack (Ridge/Huber/HistGB/GBR/XGB/HistGB-bag) + q50 blend",
             "elo_variant": final_core_candidate.elo_variant,
             "feature_profile": final_core_candidate.feature_profile,
             "half_life_days": final_core_candidate.half_life_days,
+            "module_name": final_sel["best_post"].module_name,
+            "eta": float(final_sel["best_post"].eta),
             "calibration_mode": final_sel["best_post"].calibration_mode,
             "scale_mode": final_sel["best_post"].scale_mode,
             "use_regime_stack": final_sel["best_post"].regime_stack,
@@ -2798,6 +3222,204 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
     timing_tag = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(os.environ.get("ALGOSPORTS_TIMING_TAG", "latest"))).strip("_") or "latest"
     timing_json_path = root / f"timing_summary_{timing_tag}.json"
     _write_json(timing_json_path, timing_summary)
+    phase_run = str(os.environ.get("ALGOSPORTS_PHASE1_RUN", "run2")).strip().lower()
+
+    oof_export = outer_oof.copy().sort_values(["outer_fold", "row_index"], kind="mergesort").reset_index(drop=True) if not outer_oof.empty else pd.DataFrame()
+    if not oof_export.empty:
+        oof_export["fold_id"] = oof_export["outer_fold"].astype(int)
+        oof_export["y_pred_base"] = oof_export["pred_raw_mean"].astype(float)
+        oof_export["y_pred_final"] = oof_export["pred_final"].astype(float)
+        oof_export["postprocess_module"] = ""
+        if not outer_summary.empty and "module_name" in outer_summary.columns:
+            mod_map = {int(r["outer_fold"]): str(r["module_name"]) for _, r in outer_summary.iterrows()}
+            oof_export["postprocess_module"] = oof_export["outer_fold"].astype(int).map(mod_map).fillna("").astype(str)
+    oof_csv_path = root / "oof_predictions.csv"
+    oof_export.to_csv(oof_csv_path, index=False)
+    oof_parquet_path = root / "oof_predictions.parquet"
+    try:
+        oof_export.to_parquet(oof_parquet_path, index=False)
+    except Exception:
+        oof_parquet_path = None
+
+    overall_metrics = (
+        _reg_metrics(oof_export["y_true"].to_numpy(dtype=float), oof_export["y_pred_final"].to_numpy(dtype=float))
+        if not oof_export.empty
+        else {"rmse": np.nan, "mae": np.nan, "tail_rmse": np.nan, "tail_dispersion_ratio": np.nan, "tail_bias": np.nan, "corr": np.nan}
+    )
+    fold2_rmse = np.nan
+    if not outer_fold_metrics.empty and int((outer_fold_metrics["outer_fold"] == 2).sum()) > 0:
+        fold2_rmse = float(outer_fold_metrics.loc[outer_fold_metrics["outer_fold"] == 2, "rmse"].iloc[0])
+    cap_hit_rate = float(outer_summary["outer_s_cap_hit"].astype(float).mean()) if (not outer_summary.empty and "outer_s_cap_hit" in outer_summary.columns) else float(final_post_model.affine_fit.get("s_cap_hit", False))
+    phase_metrics = {
+        "mean_rmse": float(outer_fold_metrics["rmse"].mean()) if not outer_fold_metrics.empty else float(overall_metrics.get("rmse", np.nan)),
+        "corr": float(overall_metrics.get("corr", np.nan)),
+        "mean_tail_dispersion": float(outer_fold_metrics["tail_dispersion_ratio"].mean()) if not outer_fold_metrics.empty else float(overall_metrics.get("tail_dispersion_ratio", np.nan)),
+        "mean_tail_bias": float(outer_fold_metrics["tail_bias"].mean()) if not outer_fold_metrics.empty else float(overall_metrics.get("tail_bias", np.nan)),
+        "fold2_rmse": float(fold2_rmse),
+        "cap_hit_rate": float(cap_hit_rate),
+        "mean_tail_rmse": float(outer_fold_metrics["tail_rmse"].mean()) if not outer_fold_metrics.empty else float(overall_metrics.get("tail_rmse", np.nan)),
+    }
+
+    selected_config_id = f"{final_core_candidate.key()}||{final_sel['best_post'].key()}"
+    selected_config = {
+        "selected_config_id": selected_config_id,
+        "selected_at_utc": pd.Timestamp.utcnow().isoformat(),
+        "phase_run": phase_run,
+        "model_family": "Regime-aware simplex stack (Ridge/Huber/HistGB/GBR/XGB/HistGB-bag) + q50 blend",
+        "core_candidate": {
+            "elo_variant": final_core_candidate.elo_variant,
+            "feature_profile": final_core_candidate.feature_profile,
+            "half_life_days": None if final_core_candidate.half_life_days is None else int(final_core_candidate.half_life_days),
+            "ridge_alpha": float(final_core_candidate.ridge_alpha),
+            "histgb_idx": int(final_core_candidate.histgb_idx),
+            "histgb_params": dict(final_histgb_params),
+        },
+        "postprocess": {
+            "module": str(final_sel["best_post"].module_name),
+            "eta": float(final_sel["best_post"].eta),
+            "calibration_mode": str(final_sel["best_post"].calibration_mode),
+            "scale_mode": str(final_sel["best_post"].scale_mode),
+            "regime_stack": bool(final_sel["best_post"].regime_stack),
+            "q50_blend": float(final_sel["best_post"].q50_blend),
+            "winsor_q": float(final_sel["best_post"].winsor_q),
+            "affine_fit": {k: (float(v) if isinstance(v, (int, float, np.floating)) else v) for k, v in dict(final_post_model.affine_fit).items()},
+        },
+        "features": [str(c) for c in selected_feature_cols],
+        "feature_count": int(len(selected_feature_cols)),
+        "phase_metrics": phase_metrics,
+        "gate_confirmation": "tail_dispersion < 0.60 and tail_improve < 1.0 => invalid",
+        "eta_grid": [float(x) for x in _env_float_list("ALGOSPORTS_ETA_GRID", ETA_GRID)],
+        "paths": {
+            "oof_predictions_csv": str(oof_csv_path),
+            "oof_predictions_parquet": str(oof_parquet_path) if oof_parquet_path is not None else "",
+            "predictions_csv": str(root / "Predictions.csv"),
+            "rankings_xlsx": str(root / "Rankings.xlsx"),
+            "final_report_pdf": str(root / "final_report.pdf"),
+            "run_report_md": str(root / "run_report.md"),
+        },
+    }
+    selected_config_path = root / "selected_config.json"
+    _write_json(selected_config_path, selected_config)
+
+    runner_eval_df = final_eval_df.copy().sort_values(["inner_rmse_final", "inner_tail_rmse_final", "inner_mae_final"], kind="mergesort").reset_index(drop=True)
+    top3 = runner_eval_df.head(3)
+    if (
+        phase_run != "run1"
+        and len(top3) >= 3
+        and top3["module_name"].astype(str).nunique() == 1
+        and str(top3.iloc[0]["module_name"]) == "expand_affine_global"
+    ):
+        probe_rows: List[dict] = []
+        for bundle in final_bundle_lookup.values():
+            cand_obj: CoreCandidate = bundle["candidate"]
+            inner_oof_probe = bundle["inner_oof"]
+            if inner_oof_probe is None or inner_oof_probe.empty:
+                continue
+            for module_name, scale_mode in [("expand_regime_affine_v2", "pooled"), ("expand_regime_affine_v2_heterosk", "regime")]:
+                best_probe = None
+                for eta in ETA_GRID:
+                    probe_cand = PostprocessCandidate(
+                        module_name=module_name,
+                        regime_stack=True,
+                        calibration_mode="regime",
+                        scale_mode=scale_mode,
+                        q50_blend=0.20,
+                        winsor_q=0.01,
+                        eta=float(eta),
+                    )
+                    m, _, _ = _evaluate_postprocess_progressive(inner_oof_probe, probe_cand)
+                    probe_score = (
+                        float(m["rmse_final"])
+                        + 0.35 * float(m["tail_rmse_final"])
+                        + 0.08 * abs(float(m["tail_bias_final"]))
+                        + 0.12 * abs(float(m["tail_dispersion_ratio_final"]) - 1.0)
+                        + 0.12 * abs(1.0 - float(m["corr_final"]))
+                        + (1000.0 if bool(m.get("invalid_gate", False)) else 0.0)
+                    )
+                    if best_probe is None or probe_score < best_probe["probe_score"]:
+                        best_probe = {"m": m, "probe_score": float(probe_score), "probe_cand": probe_cand}
+                if best_probe is not None:
+                    m = best_probe["m"]
+                    pc = best_probe["probe_cand"]
+                    probe_rows.append(
+                        {
+                            "core_candidate_key": cand_obj.key(),
+                            "elo_variant": cand_obj.elo_variant,
+                            "feature_profile": cand_obj.feature_profile,
+                            "half_life_days": np.nan if cand_obj.half_life_days is None else cand_obj.half_life_days,
+                            "ridge_alpha": cand_obj.ridge_alpha,
+                            "histgb_idx": cand_obj.histgb_idx,
+                            "postprocess_key": pc.key(),
+                            "module_name": pc.module_name,
+                            "eta": float(pc.eta),
+                            "inner_rmse_final": float(m["rmse_final"]),
+                            "inner_mae_final": float(m["mae_final"]),
+                            "inner_tail_rmse_final": float(m["tail_rmse_final"]),
+                            "inner_tail_dispersion_ratio_final": float(m["tail_dispersion_ratio_final"]),
+                            "inner_tail_bias_final": float(m["tail_bias_final"]),
+                            "inner_corr_final": float(m["corr_final"]),
+                            "inner_cap_hit_rate": float(m["cap_hit_rate"]),
+                            "inner_invalid_gate": bool(m["invalid_gate"]),
+                            "inner_rmse_q50": float(m["rmse_q50"]),
+                            "inner_rmse_mean_stack": float(m["rmse_mean_stack"]),
+                            "use_regime_stack": True,
+                            "calibration_mode": "regime",
+                            "scale_mode": scale_mode,
+                            "q50_blend": float(pc.q50_blend),
+                            "winsor_q": float(pc.winsor_q),
+                        }
+                    )
+        if probe_rows:
+            runner_eval_df = pd.concat([runner_eval_df, pd.DataFrame(probe_rows)], ignore_index=True)
+            runner_eval_df = (
+                runner_eval_df.sort_values(["inner_rmse_final", "inner_tail_rmse_final", "inner_mae_final"], kind="mergesort")
+                .drop_duplicates(subset=["core_candidate_key", "postprocess_key"], keep="first")
+                .reset_index(drop=True)
+            )
+
+    runner_up_payload = {
+        "timestamp_utc": pd.Timestamp.utcnow().isoformat(),
+        "phase_run": phase_run,
+        "chosen_config_id": selected_config_id,
+        "top_candidates": json.loads(runner_eval_df.head(10).to_json(orient="records")),
+    }
+    runner_up_path = root / "runner_up_configs.json"
+    _write_json(runner_up_path, runner_up_payload)
+
+    run_metadata = {
+        "timestamp_utc": pd.Timestamp.utcnow().isoformat(),
+        "phase_run": phase_run,
+        "seed": int(seed),
+        "runtime_config": {
+            "max_total_seconds": int(runtime_cfg.max_total_seconds),
+            "max_scan_seconds": int(runtime_cfg.max_scan_seconds),
+            "max_fits": int(runtime_cfg.max_fits),
+            "fast_mode": bool(runtime_cfg.fast_mode),
+            "enable_optimizations": bool(runtime_cfg.enable_optimizations),
+        },
+        "search_env": {
+            "ALGOSPORTS_MAX_MODEL_FITS": str(os.environ.get("ALGOSPORTS_MAX_MODEL_FITS", runtime_cfg.max_fits)),
+            "ALGOSPORTS_MAX_FITS": str(os.environ.get("ALGOSPORTS_MAX_FITS", runtime_cfg.max_fits)),
+            "ALGOSPORTS_MAX_TOTAL_SECONDS": str(os.environ.get("ALGOSPORTS_MAX_TOTAL_SECONDS", runtime_cfg.max_total_seconds)),
+            "ALGOSPORTS_MAX_SCAN_SECONDS": str(os.environ.get("ALGOSPORTS_MAX_SCAN_SECONDS", runtime_cfg.max_scan_seconds)),
+        },
+        "fallback_triggered": bool(
+            any(
+                k in {"max_fits", "max_total_seconds", "max_scan_seconds"}
+                for k in (_ACTIVE_BUDGET.triggered.keys() if _ACTIVE_BUDGET is not None else [])
+            )
+        ),
+        "no_regression_to_mean_shortcut": True,
+        "budget_triggered": list((_ACTIVE_BUDGET.triggered.keys() if _ACTIVE_BUDGET is not None else [])),
+        "model_fit_count": int(_ACTIVE_BUDGET.fit_count) if _ACTIVE_BUDGET is not None else int(timing_summary.get("total_model_fit_count", 0)),
+        "phase_metrics": phase_metrics,
+        "selected_config_path": str(selected_config_path),
+        "runner_up_configs_path": str(runner_up_path),
+        "oof_predictions_csv": str(oof_csv_path),
+        "timing_summary_path": str(timing_json_path),
+    }
+    run_metadata_path = root / "run_metadata.json"
+    _write_json(run_metadata_path, run_metadata)
     _write_run_report(
         root / "run_report.md",
         root=root,
@@ -2806,18 +3428,22 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
         budget=_ACTIVE_BUDGET,
         timing_summary=timing_summary,
         selected_summary={
-            "model_family": "Regime-aware simplex stack (Ridge/Huber/HistGB/HistGB-bag) + q50 blend",
+            "model_family": "Regime-aware simplex stack (Ridge/Huber/HistGB/GBR/XGB/HistGB-bag) + q50 blend",
             "elo_variant": final_core_candidate.elo_variant,
             "feature_profile": final_core_candidate.feature_profile,
             "half_life_days": final_core_candidate.half_life_days,
+            "module_name": final_sel["best_post"].module_name,
+            "eta": float(final_sel["best_post"].eta),
             "calibration_mode": final_sel["best_post"].calibration_mode,
             "scale_mode": final_sel["best_post"].scale_mode,
             "use_regime_stack": final_sel["best_post"].regime_stack,
         },
+        selected_features=selected_feature_cols,
         outer_rmse=outer_rmse,
         outer_mae=outer_mae,
         predictions_out=pred_out,
         rankings_out=rankings_out,
+        phase_metrics=phase_metrics,
     )
     print("\n" + "\n".join(_timing_summary_lines(timing_summary, focus_phases=focus_phases, top_n=10)))
     _ACTIVE_PROFILER = prev_profiler
@@ -2832,6 +3458,8 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
         "calibration_type": final_sel["best_post"].calibration_mode,
         "scale_correction_type": final_sel["best_post"].scale_mode,
         "regime_specific_stack_used": bool(final_sel["best_post"].regime_stack),
+        "selected_module": final_sel["best_post"].module_name,
+        "selected_eta": float(final_sel["best_post"].eta),
         "predictions_head": prediction_head.copy(),
         "rankings_top10": rankings_out.sort_values("Rank", kind="mergesort").head(10).copy(),
         "dispersion_guard_applied": dispersion_guard_applied,
@@ -2842,4 +3470,10 @@ def run_nextgen_pipeline(root: Path, seed: int = SEED_DEFAULT) -> dict:
         "timing_summary": timing_summary,
         "timing_summary_path": str(timing_json_path),
         "run_report_path": str(root / "run_report.md"),
+        "oof_predictions_path": str(oof_csv_path),
+        "selected_config_path": str(selected_config_path),
+        "runner_up_configs_path": str(runner_up_path),
+        "run_metadata_path": str(run_metadata_path),
+        "phase_metrics": phase_metrics,
+        "model_fit_count": int(_ACTIVE_BUDGET.fit_count) if _ACTIVE_BUDGET is not None else int(timing_summary.get("total_model_fit_count", 0)),
     }

@@ -1,14 +1,14 @@
 # AlgoSports23 Run Report
 
-- Timestamp (UTC): 2026-03-03T02:48:36.036218+00:00
-- Working directory: `C:\algosports23\AlgoSports23-Challenge`
-- Thread limits: `OMP_NUM_THREADS=1`, `MKL_NUM_THREADS=1`
-- Runtime config: fast_mode=0, max_total=3600s, max_scan=1200s, max_fits=8000, bag_n=2, optimizations=1
+- Timestamp (UTC): 2026-03-02T07:23:29.998215+00:00
+- Working directory: `.`
+- Thread limits: `OMP_NUM_THREADS=`, `MKL_NUM_THREADS=`
+- Runtime config: fast_mode=0, max_total=1200s, max_scan=400s, max_fits=2500, bag_n=2, optimizations=1
 
 ## Files Used / Found
-- train: `C:\algosports23\AlgoSports23-Challenge\Train.csv` (exists=True)
-- pred: `C:\algosports23\AlgoSports23-Challenge\Predictions.csv` (exists=True)
-- rankings: `C:\algosports23\AlgoSports23-Challenge\Rankings.xlsx` (exists=True)
+- train: `Train.csv` (exists=True)
+- pred: `Predictions.csv` (exists=True)
+- rankings: `Rankings.xlsx` (exists=True)
 
 ## Fast Profile Findings
 - Fast profile timing summary loaded from `timing_summary_fast.json`.
@@ -72,67 +72,82 @@ Top 10 slowest call sites / phases:
 ```text
 Runtime timing summary
 Hotspot totals (sec):
-- _scan_and_select_core_candidates: 205.703s (calls=6)
-- _core_scan_score: 205.676s (calls=348)
-- _generate_inner_oof_and_outer_preds: 687.477s (calls=30)
-- _predict_family: 903.200s (calls=2098)
-- _build_split_tables: 2.375s (calls=48)
-- _prepare_variant_outer_data: 2.619s (calls=12)
+- _scan_and_select_core_candidates: 137.848s (calls=6)
+- _core_scan_score: 137.763s (calls=3480)
+- _generate_inner_oof_and_outer_preds: 78.755s (calls=48)
+- _predict_family: 211.260s (calls=10520)
+- _build_split_tables: 4.753s (calls=96)
+- _prepare_variant_outer_data: 5.270s (calls=24)
 Predict family totals (sec):
-- gbr: 306.227s (calls=121)
-- histgb: 256.400s (calls=685)
-- xgb: 105.394s (calls=121)
-- histgb_bag: 105.127s (calls=121)
-- histgb_q50: 90.843s (calls=121)
-- huber: 36.559s (calls=121)
-- ridge: 1.227s (calls=685)
-- histgb_q80: 0.658s (calls=1)
-- histgb_q20: 0.645s (calls=1)
-- enet_f2: 0.122s (calls=121)
+- histgb: 139.886s (calls=4873)
+- histgb_q50: 23.931s (calls=193)
+- gbr: 20.922s (calls=193)
+- histgb_bag: 17.403s (calls=193)
+- huber: 7.398s (calls=193)
+- ridge: 1.720s (calls=4873)
+- histgb_q80: 0.000s (calls=1)
+- histgb_q20: 0.000s (calls=1)
 Model fit counts by family:
-- enet_f2: 121
-- gbr: 121
-- histgb: 685
-- histgb_bag: 242
-- histgb_q20: 1
-- histgb_q50: 121
-- histgb_q80: 1
-- huber: 121
-- ridge: 685
-- xgb: 121
+- gbr: 32
+- histgb: 1170
+- histgb_bag: 64
+- histgb_q50: 32
+- huber: 32
+- ridge: 1170
 Top 10 slowest call sites / phases:
-1. run_nextgen_pipeline_total [total]: 932.850s
-2. _generate_inner_oof_and_outer_preds: 52.891s
-3. _generate_inner_oof_and_outer_preds: 51.243s
-4. _scan_and_select_core_candidates: 51.084s
-5. _generate_inner_oof_and_outer_preds: 49.354s
-6. _scan_and_select_core_candidates: 44.687s
-7. _scan_and_select_core_candidates: 39.485s
-8. _generate_inner_oof_and_outer_preds: 38.519s
-9. _scan_and_select_core_candidates: 34.340s
-10. _generate_inner_oof_and_outer_preds: 30.317s
+1. run_nextgen_pipeline_total [total]: 323.794s
+2. _scan_and_select_core_candidates: 93.804s
+3. _scan_and_select_core_candidates: 40.928s
+4. _generate_inner_oof_and_outer_preds: 10.233s
+5. _generate_inner_oof_and_outer_preds: 9.977s
+6. _generate_inner_oof_and_outer_preds: 9.931s
+7. _generate_inner_oof_and_outer_preds: 9.764s
+8. _generate_inner_oof_and_outer_preds: 9.665s
+9. _generate_inner_oof_and_outer_preds: 9.661s
+10. _generate_inner_oof_and_outer_preds: 9.648s
 ```
 
 ## Budgets / Safety Controls
-- Elapsed wall time (pipeline): 932.90s
-- Fit count used: 2219
-- Budgets triggered: none
+- Elapsed wall time (pipeline): 328.44s
+- Fit count used: 2500
+- Budgets triggered: histgb_bag_auto_reduce, max_fits
+- Budget events:
+  - max_fits: fit cap reached before ridge; requested=1, used=2500, budget=2500
+  - max_fits: fit cap reached before histgb; requested=1, used=2500, budget=2500
+  - max_fits: fit cap reached before ridge; requested=1, used=2500, budget=2500
+  - max_fits: fit cap reached before histgb; requested=1, used=2500, budget=2500
+  - max_fits: fit cap reached before ridge; requested=1, used=2500, budget=2500
+  - max_fits: fit cap reached before histgb; requested=1, used=2500, budget=2500
+  - max_fits: fit cap reached before ridge; requested=1, used=2500, budget=2500
+  - max_fits: fit cap reached before histgb; requested=1, used=2500, budget=2500
+  - max_fits: fit cap reached before ridge; requested=1, used=2500, budget=2500
+  - max_fits: fit cap reached before histgb; requested=1, used=2500, budget=2500
+  - max_fits: fit cap reached before ridge; requested=1, used=2500, budget=2500
+  - max_fits: fit cap reached before histgb; requested=1, used=2500, budget=2500
+  - max_fits: fit cap reached before ridge; requested=1, used=2500, budget=2500
+  - max_fits: fit cap reached before histgb; requested=1, used=2500, budget=2500
+  - max_fits: fit cap reached before ridge; requested=1, used=2500, budget=2500
+  - max_fits: fit cap reached before histgb; requested=1, used=2500, budget=2500
+  - max_fits: fit cap reached before ridge; requested=1, used=2500, budget=2500
+  - max_fits: fit cap reached before histgb; requested=1, used=2500, budget=2500
+  - max_fits: fit cap reached before ridge; requested=1, used=2500, budget=2500
+  - max_fits: fit cap reached before histgb; requested=1, used=2500, budget=2500
 
 ## Chosen Model / CV Metrics
-- Selected model family: Regime-aware simplex stack (Ridge/Huber/HistGB/GBR/XGB/HistGB-bag) + q50 blend
+- Selected model family: Regime-aware simplex stack (Ridge/Huber/HistGB/GBR/HistGB-bag) + q50 blend
 - Selected Elo variant: elo_base_static
 - Feature profile / half-life: compact_recency / None
 - Selected postprocess module: expand_affine_global
 - Selected ETA: 0.55
-- Calibration / scale / regime stack: none / none / False
-- Nested outer RMSE / MAE: 37.39762 / 29.44717
+- Calibration / scale / regime stack: pooled / none / False
+- Nested outer RMSE / MAE: 44.18581 / 34.81801
 - Phase metrics:
-  - mean_rmse=36.598070
-  - corr=0.523716
-  - mean_tail_dispersion=0.441708
-  - mean_tail_bias=-9.136117
-  - fold2_rmse=38.922697
-  - cap_hit_rate=0.000000
+  - mean_rmse=43.562967
+  - corr=0.192085
+  - mean_tail_dispersion=0.109066
+  - mean_tail_bias=-10.568591
+  - fold2_rmse=44.365581
+  - cap_hit_rate=0.800000
 - Regime gate change applied: tail_dispersion < 0.60 and tail_improve < 1.0 => invalid.
 - ETA grid evaluated: 0.55, 0.60, 0.65, 0.70, 0.75, 0.80
 - Selected feature count: 169
@@ -143,7 +158,7 @@ Top 10 slowest call sites / phases:
 - rankings.xlsx rows=165; Rank exactly 1..165=True
 
 ## Output File Paths
-- `C:\algosports23\AlgoSports23-Challenge\predictions.csv` (exists=True, bytes=4413)
-- `C:\algosports23\AlgoSports23-Challenge\rankings.xlsx` (exists=True, bytes=8742)
-- `C:\algosports23\AlgoSports23-Challenge\final_report.pdf` (exists=True, bytes=228592)
-- `C:\algosports23\AlgoSports23-Challenge\run_report.md` (exists=True, bytes=10540)
+- `predictions.csv` (exists=True, bytes=4188)
+- `rankings.xlsx` (exists=True, bytes=8740)
+- `final_report.pdf` (exists=True, bytes=218328)
+- `run_report.md` (exists=True, bytes=10201)

@@ -73,6 +73,18 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    s = str(raw).strip().lower()
+    if s in {"1", "true", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(default)
+
+
 _CPU_COUNT = os.cpu_count() or 8
 N_JOBS = max(1, _env_int("ALGOSPORTS_N_JOBS", min(8, max(1, _CPU_COUNT - 2))))
 MAX_MODEL_FITS = max(1, _env_int("ALGOSPORTS_MAX_MODEL_FITS", 800))
@@ -92,6 +104,51 @@ POSTPROCESS_MODULES = [
     "expand_piecewise_tail_v2",
 ]
 BASELINE_DISPERSION_RATIO_REFERENCE = 43.62 / 26.15
+
+
+def _resolved_nextgen_budget() -> Dict[str, Any]:
+    fit_default = _env_int("ALGOSPORTS_MAX_MODEL_FITS", 1000)
+    return {
+        "max_total_seconds": _env_int("ALGOSPORTS_MAX_TOTAL_SECONDS", 1200),
+        "max_scan_seconds": _env_int("ALGOSPORTS_MAX_SCAN_SECONDS", 300),
+        "max_fits": _env_int("ALGOSPORTS_MAX_FITS", fit_default),
+        "raw_env": {
+            "ALGOSPORTS_MAX_MODEL_FITS": os.environ.get("ALGOSPORTS_MAX_MODEL_FITS"),
+            "ALGOSPORTS_MAX_FITS": os.environ.get("ALGOSPORTS_MAX_FITS"),
+            "ALGOSPORTS_MAX_TOTAL_SECONDS": os.environ.get("ALGOSPORTS_MAX_TOTAL_SECONDS"),
+            "ALGOSPORTS_MAX_SCAN_SECONDS": os.environ.get("ALGOSPORTS_MAX_SCAN_SECONDS"),
+        },
+    }
+
+
+def _write_budget_failure_metadata(reason: str, budget_triggered: Sequence[str]) -> None:
+    budget = _resolved_nextgen_budget()
+    payload = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "phase_run": str(os.environ.get("ALGOSPORTS_PHASE1_RUN", "run2")).strip().lower(),
+        "seed": int(SEED),
+        "runtime_config": {
+            "max_total_seconds": int(budget["max_total_seconds"]),
+            "max_scan_seconds": int(budget["max_scan_seconds"]),
+            "max_fits": int(budget["max_fits"]),
+            "fast_mode": bool(_env_bool("ALGOSPORTS_FAST_MODE", False)),
+            "enable_optimizations": bool(_env_bool("ALGOSPORTS_ENABLE_OPTIMIZATIONS", True)),
+        },
+        "search_env": {
+            "ALGOSPORTS_MAX_MODEL_FITS": str(os.environ.get("ALGOSPORTS_MAX_MODEL_FITS", budget["max_fits"])),
+            "ALGOSPORTS_MAX_FITS": str(os.environ.get("ALGOSPORTS_MAX_FITS", budget["max_fits"])),
+            "ALGOSPORTS_MAX_TOTAL_SECONDS": str(os.environ.get("ALGOSPORTS_MAX_TOTAL_SECONDS", budget["max_total_seconds"])),
+            "ALGOSPORTS_MAX_SCAN_SECONDS": str(os.environ.get("ALGOSPORTS_MAX_SCAN_SECONDS", budget["max_scan_seconds"])),
+        },
+        "resolved_budget_config": budget,
+        "budget_triggered": list(budget_triggered),
+        "fallback_triggered": True,
+        "no_regression_to_mean_shortcut": False,
+        "model_fit_count": 0,
+        "phase_metrics": {},
+        "error": str(reason),
+    }
+    _json_dump(ROOT / "run_metadata.json", payload)
 
 
 def _resolve_input_path(candidates: Sequence[Path], label: str) -> Path:
@@ -115,6 +172,10 @@ def _git_hash() -> str:
 
 def _json_dump(path: Path, obj: Mapping) -> None:
     path.write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _json_load(path: Path) -> Dict:
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _sha256(path: Path) -> str:
@@ -1110,6 +1171,45 @@ def _write_run_report_md(
 
 
 def main() -> int:
+    engine = str(os.environ.get("ALGOSPORTS_PIPELINE_ENGINE", "nextgen")).strip().lower()
+    if engine != "legacy":
+        from src.nextgen_pipeline import BudgetExhaustedError, run_nextgen_pipeline
+
+        abort_on_budget = bool(_env_bool("ALGOSPORTS_ABORT_ON_BUDGET_HIT", False))
+        try:
+            result = run_nextgen_pipeline(ROOT, seed=SEED)
+        except BudgetExhaustedError as e:
+            msg = str(e).lower()
+            if "total-time" in msg or "max_total" in msg:
+                trig = ["max_total_seconds"]
+            elif "scan" in msg:
+                trig = ["max_scan_seconds"]
+            else:
+                trig = ["max_fits"]
+            _write_budget_failure_metadata(str(e), budget_triggered=trig)
+            print(f"[nextgen] budget failure: {e}")
+            return 3
+        except Exception:
+            raise
+
+        md_path = ROOT / "run_metadata.json"
+        md = _json_load(md_path) if md_path.exists() else {}
+        budget_triggered_all = [str(x) for x in md.get("budget_triggered", [])]
+        hard_budget_hits = [k for k in budget_triggered_all if k in {"max_fits", "max_total_seconds", "max_scan_seconds"}]
+        md["budget_triggered"] = budget_triggered_all
+        md["fallback_triggered"] = bool(hard_budget_hits)
+        md["no_regression_to_mean_shortcut"] = bool(md.get("no_regression_to_mean_shortcut", not bool(hard_budget_hits)))
+        md["resolved_budget_config"] = _resolved_nextgen_budget()
+        _json_dump(md_path, md)
+        print(f"[nextgen] selected_model_family={result.get('selected_model_family')}")
+        print(f"[nextgen] selected_module={result.get('selected_module')} eta={result.get('selected_eta')}")
+        print(f"[nextgen] phase_metrics={result.get('phase_metrics')}")
+        print(f"[nextgen] model_fit_count={result.get('model_fit_count')}")
+        if abort_on_budget and hard_budget_hits:
+            print(f"[nextgen] abort_on_budget_hit=1 and budget triggered: {hard_budget_hits}")
+            return 3
+        return 0
+
     np.random.seed(SEED)
     run_start_ts = time.time()
 

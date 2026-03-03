@@ -1,38 +1,46 @@
 {
-  "budget_info": {
-    "elapsed_seconds": 36.097418546676636,
-    "max_model_fits": 800,
-    "max_total_seconds": 900,
-    "model_fit_count": 375,
-    "stopped_on_model_fits": false,
-    "stopped_on_time": false
+  "budget_triggered": [],
+  "fallback_triggered": false,
+  "model_fit_count": 2219,
+  "no_regression_to_mean_shortcut": true,
+  "oof_predictions_csv": "C:\\algosports23\\AlgoSports23-Challenge\\oof_predictions.csv",
+  "phase_metrics": {
+    "cap_hit_rate": 0.0,
+    "corr": 0.523715606436142,
+    "fold2_rmse": 38.922696534809496,
+    "mean_rmse": 36.598070146036235,
+    "mean_tail_bias": -9.136117323145061,
+    "mean_tail_dispersion": 0.4417080855547648,
+    "mean_tail_rmse": 57.2834647262845
   },
-  "cpu_count": 16,
-  "cwd": "C:\\algosports23\\AlgoSports23-Challenge",
-  "git_hash": "1aaa14e93a225970a75736c5fd1f73a703e08fc3",
-  "input_paths": {
-    "predictions_seed": "C:\\algosports23\\AlgoSports23-Challenge\\Submission.zip\\Predictions.csv",
-    "rankings_seed": "C:\\algosports23\\AlgoSports23-Challenge\\Submission.zip\\Rankings.xlsx",
-    "train": "C:\\algosports23\\AlgoSports23-Challenge\\Train.csv"
+  "phase_run": "run1",
+  "resolved_budget_config": {
+    "max_fits": 8000,
+    "max_scan_seconds": 1200,
+    "max_total_seconds": 3600,
+    "raw_env": {
+      "ALGOSPORTS_MAX_FITS": "8000",
+      "ALGOSPORTS_MAX_MODEL_FITS": "8000",
+      "ALGOSPORTS_MAX_SCAN_SECONDS": "1200",
+      "ALGOSPORTS_MAX_TOTAL_SECONDS": "3600"
+    }
   },
-  "machine": "AMD64",
-  "max_model_fits": 800,
-  "max_total_seconds": 900,
-  "n_jobs": 5,
-  "outer_fold_count": 5,
-  "platform": "Windows-10-10.0.19045-SP0",
-  "processor": "Intel64 Family 6 Model 167 Stepping 1, GenuineIntel",
-  "python": "3.13.0 (tags/v3.13.0:60403a5, Oct  7 2024, 09:38:07) [MSC v.1941 64 bit (AMD64)]",
+  "runner_up_configs_path": "C:\\algosports23\\AlgoSports23-Challenge\\runner_up_configs.json",
+  "runtime_config": {
+    "enable_optimizations": true,
+    "fast_mode": false,
+    "max_fits": 8000,
+    "max_scan_seconds": 1200,
+    "max_total_seconds": 3600
+  },
   "search_env": {
-    "ALGOSPORTS_MAX_MODEL_FITS": "800",
-    "ALGOSPORTS_MAX_TOTAL_SECONDS": "900",
-    "ALGOSPORTS_N_JOBS": "8"
+    "ALGOSPORTS_MAX_FITS": "8000",
+    "ALGOSPORTS_MAX_MODEL_FITS": "8000",
+    "ALGOSPORTS_MAX_SCAN_SECONDS": "1200",
+    "ALGOSPORTS_MAX_TOTAL_SECONDS": "3600"
   },
-  "thread_env": {
-    "MKL_NUM_THREADS": "1",
-    "NUMEXPR_NUM_THREADS": "1",
-    "OMP_NUM_THREADS": "1",
-    "OPENBLAS_NUM_THREADS": "1"
-  },
-  "timestamp_utc": "2026-02-27T02:47:29.836702+00:00"
+  "seed": 23,
+  "selected_config_path": "C:\\algosports23\\AlgoSports23-Challenge\\selected_config.json",
+  "timestamp_utc": "2026-03-03T02:48:36.035014+00:00",
+  "timing_summary_path": "C:\\algosports23\\AlgoSports23-Challenge\\timing_summary_phase1_debug_run1_noaffine.json"
 }

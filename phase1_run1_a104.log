@@ -1,0 +1,5 @@
+[nextgen] Resolved Budget Config: max_total_seconds=2400, max_scan_seconds=900, max_fits=4200 | raw_env={'ALGOSPORTS_MAX_MODEL_FITS': '4200', 'ALGOSPORTS_MAX_FITS': '4200', 'ALGOSPORTS_MAX_TOTAL_SECONDS': '2400', 'ALGOSPORTS_MAX_SCAN_SECONDS': '900'}
+[nextgen] budget failure: Fit budget exhausted before fitting family=ridge (requested=1).
+
+
+--- STDERR ---

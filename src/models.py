@@ -18,7 +18,7 @@ SEED = 23
 F1_FEATURES = ["massey_diff", "games_played_diff", "volatility_diff"]
 F2_FEATURES = ["massey_diff", "elok_diff", "games_played_diff", "volatility_diff"]
 UNDERDISP_THRESHOLD = 0.90
-ETA_GRID = [0.55, 0.60, 0.65, 0.70]
+ETA_GRID = [0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
 FOLD_WEIGHTS = {1: 0.10, 2: 0.15, 3: 0.20, 4: 0.25, 5: 0.30}
 
 
@@ -395,7 +395,7 @@ def fit_postprocessor(module_name: str, oof_df: pd.DataFrame) -> dict:
             met_b = regression_metrics(yb, pb)
             met_r = regression_metrics(yb, pr)
             tail_improve = float(met_b["tail_rmse"] - met_r["tail_rmse"])
-            if float(met_r["tail_dispersion_ratio"]) < 0.85 and tail_improve < 2.0:
+            if float(met_r["tail_dispersion_ratio"]) < 0.60 and tail_improve < 1.0:
                 invalid = True
                 reason = "blowout_taildisp_gate"
             if float(np.std(pb, ddof=0) / max(np.std(yb, ddof=0), 1e-9)) < 0.7:

@@ -34,6 +34,23 @@ class EloModel:
     decay_g: float
 
 
+@dataclass(frozen=True)
+class EloVariantConfig:
+    name: str
+    home_adv: float = 55.0
+    k_factor: float = 24.0
+    use_dynamic_k: bool = False
+    k_early_multiplier: float = 1.0
+    k_games_scale: float = 16.0
+    k_uncertainty_multiplier: float = 0.0
+    use_team_home_adv: bool = False
+    team_home_adv_scale: float = 72.0
+    team_home_adv_reg: float = 7.0
+    team_home_adv_cap: float = 45.0
+    use_inactivity_decay: bool = False
+    inactivity_tau_days: float = 95.0
+
+
 def fit_massey_ridge(games: pd.DataFrame, team_ids: Sequence[int], alpha: float = 10.0) -> MasseyModel:
     team_ids = [int(t) for t in team_ids]
     team_to_pos = {tid: i for i, tid in enumerate(team_ids)}
